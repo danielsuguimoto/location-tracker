@@ -23,6 +23,16 @@ CREATE TABLE IF NOT EXISTS meta (
 
 INSERT OR IGNORE INTO meta (key, value) VALUES ('last_tst', 0);
 
+-- Evaluated fixes at the active timestamp: survives location-history pruning
+-- so replays of evicted rows stay deduplicated. id doubles as eval order.
+CREATE TABLE IF NOT EXISTS eval_fixes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tst INTEGER NOT NULL,
+  lat REAL NOT NULL,
+  lon REAL NOT NULL,
+  UNIQUE (tst, lat, lon)
+);
+
 CREATE TABLE IF NOT EXISTS webhooks (
   id TEXT PRIMARY KEY,
   client_id TEXT NOT NULL,

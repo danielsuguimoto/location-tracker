@@ -4,11 +4,9 @@ import { parseOwnTracksPayload } from "./owntracks";
 import {
   insertLocation,
   pruneLocations,
-  listGeofences,
-  casGeofenceState,
   claimEval,
+  evalAndStore,
 } from "./db";
-import { haversineMeters, transitionEvent, type GeofenceState } from "./geo";
 import { deliverEvent } from "./notify";
 import { safeEqualBytes } from "./session";
 
@@ -65,38 +63,31 @@ export async function handleIngest(
   if (parsed.kind !== "location") return EMPTY_FRIENDS();
 
   const loc = parsed.location;
-  // Decide before inserting: stale replays (older tst, or an identical fix
-  // re-sent) are kept in history but must not move "current" location or
-  // geofence state. The CAS on meta.last_tst also serializes concurrent
-  // ingests: losers see no change.
-  const evalThis = await claimEval(env.DB, loc.tst, loc.lat, loc.lon);
-  await insertLocation(env.DB, loc);
-  await pruneLocations(env.DB, historySize(env));
-
-  if (evalThis) {
-    const fences = await listGeofences(env.DB);
-    const firedAt = Math.floor(Date.now() / 1000);
-    for (const fence of fences) {
-      const inside =
-        haversineMeters(loc.lat, loc.lon, fence.lat, fence.lon) <=
-        fence.radius_m;
-      const current: GeofenceState = inside ? "inside" : "outside";
-      const event = transitionEvent(fence.last_state, current);
-      if (event === null && fence.last_state !== null) continue;
-      const wants =
-        event === "enter" ? fence.on_enter === 1 : event === "exit" ? fence.on_exit === 1 : false;
-      const won = await casGeofenceState(
-        env.DB,
-        fence.id,
-        fence.last_state,
-        current,
-        event && wants ? firedAt : null,
-      );
-      if (won && event && wants) {
-        const fenceCopy = { ...fence, last_state: current };
-        ctx.waitUntil(deliverEvent(env, fenceCopy, event, loc));
-      }
+  // Stale uploads (older tst) are kept in history but must not move "current"
+  // location or geofence state; exact replays are dropped entirely. Dedupe
+  // claims live in eval_fixes, uncapped by history pruning.
+  const claim = await claimEval(env.DB, loc.tst, loc.lat, loc.lon);
+  if (claim.kind === "replay") return EMPTY_FRIENDS();
+  if (claim.kind === "eval") {
+    // Atomic batch: stale guard + insert + per-fence CAS + eval marker + prune.
+    const fired = await evalAndStore(
+      env.DB,
+      loc,
+      claim.evalId,
+      historySize(env),
+    );
+    if (fired === null) {
+      // Lost the race to a newer tst: keep the row as history, skip eval.
+      await insertLocation(env.DB, loc);
+      await pruneLocations(env.DB, historySize(env));
+      return EMPTY_FRIENDS();
     }
+    for (const { fence, event } of fired) {
+      ctx.waitUntil(deliverEvent(env, fence, event, loc));
+    }
+  } else {
+    await insertLocation(env.DB, loc);
+    await pruneLocations(env.DB, historySize(env));
   }
   return EMPTY_FRIENDS();
 }

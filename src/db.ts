@@ -53,11 +53,11 @@ export interface DeliveryRow {
 const LOCATION_COLS =
   "id, device, lat, lon, acc, alt, vel, cog, batt, trigger, tst, received_at";
 
-export async function insertLocation(
+export function insertLocationStmt(
   db: D1Database,
   loc: LocationUpdate,
-): Promise<void> {
-  await db
+): D1PreparedStatement {
+  return db
     .prepare(
       `INSERT INTO locations (device, lat, lon, acc, alt, vel, cog, batt, trigger, tst, raw)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -74,8 +74,14 @@ export async function insertLocation(
       loc.trigger,
       loc.tst,
       loc.raw,
-    )
-    .run();
+    );
+}
+
+export async function insertLocation(
+  db: D1Database,
+  loc: LocationUpdate,
+): Promise<void> {
+  await insertLocationStmt(db, loc).run();
 }
 
 export async function pruneLocations(
@@ -94,6 +100,18 @@ export async function pruneLocations(
 export async function latestLocation(
   db: D1Database,
 ): Promise<LocationRow | null> {
+  // "Current" = the last fix that claimed evaluation, resolved through
+  // eval_fixes so a stored-but-rejected replay can't impersonate it.
+  const evaluated = await db
+    .prepare(
+      `SELECT ${LOCATION_COLS} FROM locations WHERE id = (
+         SELECT l2.id FROM locations l2
+         JOIN eval_fixes e ON e.tst = l2.tst AND e.lat = l2.lat AND e.lon = l2.lon
+         WHERE e.id = (SELECT value FROM meta WHERE key = 'last_eval_id')
+         ORDER BY l2.id LIMIT 1)`,
+    )
+    .first<LocationRow>();
+  if (evaluated) return evaluated;
   return db
     .prepare(
       `SELECT ${LOCATION_COLS} FROM locations ORDER BY tst DESC, id DESC LIMIT 1`,
@@ -114,15 +132,21 @@ export async function listLocations(
   return results;
 }
 
+export type EvalClaim =
+  | { kind: "eval"; evalId: number }
+  | { kind: "stale" }
+  | { kind: "replay" };
+
 // Decides whether an upload may update "current" location and geofence
-// state. Must run BEFORE insertLocation: an identical (tst,lat,lon) row
-// already stored means this is a replay, not a distinct same-second fix.
+// state. Dedupe claims live in eval_fixes (uncapped by history pruning):
+// a strictly newer tst wins outright; at equal tst, the unique insert
+// separates a distinct same-second fix from an exact replay.
 export async function claimEval(
   db: D1Database,
   tst: number,
   lat: number,
   lon: number,
-): Promise<boolean> {
+): Promise<EvalClaim> {
   await db
     .prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('last_tst', 0)")
     .run();
@@ -132,18 +156,26 @@ export async function claimEval(
     )
     .bind(tst, tst)
     .run();
-  if ((meta.changes ?? 0) > 0) return true;
+  if ((meta.changes ?? 0) > 0) {
+    // Timestamp advanced: dedupe rows for older timestamps are useless.
+    await db.prepare("DELETE FROM eval_fixes WHERE tst < ?").bind(tst).run();
+    const ins = await db
+      .prepare("INSERT OR IGNORE INTO eval_fixes (tst, lat, lon) VALUES (?, ?, ?)")
+      .bind(tst, lat, lon)
+      .run();
+    if ((ins.meta.changes ?? 0) === 0) return { kind: "replay" };
+    return { kind: "eval", evalId: Number(ins.meta.last_row_id) };
+  }
   const row = await db
     .prepare("SELECT value FROM meta WHERE key = 'last_tst'")
     .first<{ value: number }>();
-  if (!row || row.value !== tst) return false;
-  const dup = await db
-    .prepare(
-      "SELECT id FROM locations WHERE tst = ? AND lat = ? AND lon = ? LIMIT 1",
-    )
+  if (!row || row.value !== tst) return { kind: "stale" };
+  const ins = await db
+    .prepare("INSERT OR IGNORE INTO eval_fixes (tst, lat, lon) VALUES (?, ?, ?)")
     .bind(tst, lat, lon)
-    .first();
-  return !dup;
+    .run();
+  if ((ins.meta.changes ?? 0) === 0) return { kind: "replay" };
+  return { kind: "eval", evalId: Number(ins.meta.last_row_id) };
 }
 
 const WEBHOOK_COLS = "id, client_id, label, url, token, created_at";
@@ -368,26 +400,94 @@ export async function setGeofenceState(
     .run();
 }
 
-// Compare-and-set: updates only while last_state still equals `previous`
-// (IS = null-safe equality), so concurrent ingests can't double-fire.
-export async function casGeofenceState(
+export interface FiredEvent {
+  fence: GeofenceRow;
+  event: "enter" | "exit";
+}
+
+// Stores the fix and applies geofence transitions in ONE batch: D1 batches
+// are atomic, so fence writes, the eval marker, and the stale guard commit
+// or roll back together. The guard statement violates NOT NULL on meta.value
+// when last_tst advanced past this fix mid-flight, aborting the whole batch
+// (returns null) — a stale claim can never land.
+// Per fence, three mutually exclusive CAS statements cover baseline
+// (IS NULL), wanted transition (-> current, fires), and unwanted transition.
+export async function evalAndStore(
   db: D1Database,
-  id: string,
-  previous: GeofenceState | null,
-  next: GeofenceState,
-  firedAt: number | null,
-): Promise<boolean> {
-  const sql = firedAt === null
-    ? "UPDATE geofences SET last_state = ? WHERE id = ? AND last_state IS ?"
-    : "UPDATE geofences SET last_state = ?, last_fired_at = ? WHERE id = ? AND last_state IS ?";
-  const args = firedAt === null
-    ? [next, id, previous]
-    : [next, firedAt, id, previous];
-  const { meta } = await db
-    .prepare(sql)
-    .bind(...args)
-    .run();
-  return (meta.changes ?? 0) > 0;
+  loc: LocationUpdate,
+  evalId: number,
+  keep: number,
+): Promise<FiredEvent[] | null> {
+  const fences = await listGeofences(db);
+  const firedAt = Math.floor(Date.now() / 1000);
+  const stmts: D1PreparedStatement[] = [
+    db
+      .prepare(
+        `INSERT INTO meta (key, value) SELECT 'guard', NULL
+         WHERE (SELECT value FROM meta WHERE key = 'last_tst') > ?`,
+      )
+      .bind(loc.tst),
+    insertLocationStmt(db, loc),
+  ];
+  const fireAt = new Map<number, { fence: GeofenceRow; event: "enter" | "exit" }>();
+  for (const fence of fences) {
+    const inside =
+      haversineMeters(loc.lat, loc.lon, fence.lat, fence.lon) <=
+      fence.radius_m;
+    const current: GeofenceState = inside ? "inside" : "outside";
+    const opposite: GeofenceState = inside ? "outside" : "inside";
+    const want = inside ? "on_enter = 1" : "on_exit = 1";
+    stmts.push(
+      db
+        .prepare(
+          "UPDATE geofences SET last_state = ? WHERE id = ? AND last_state IS NULL",
+        )
+        .bind(current, fence.id),
+    );
+    fireAt.set(stmts.length, {
+      fence: { ...fence, last_state: current },
+      event: inside ? "enter" : "exit",
+    });
+    stmts.push(
+      db
+        .prepare(
+          `UPDATE geofences SET last_state = ?, last_fired_at = ?
+           WHERE id = ? AND last_state = ? AND ${want}`,
+        )
+        .bind(current, firedAt, fence.id, opposite),
+      db
+        .prepare(
+          `UPDATE geofences SET last_state = ?
+           WHERE id = ? AND last_state = ? AND NOT ${want}`,
+        )
+        .bind(current, fence.id, opposite),
+    );
+  }
+  stmts.push(
+    db
+      .prepare(
+        `INSERT INTO meta (key, value) VALUES ('last_eval_id', ?)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
+      )
+      .bind(evalId),
+    db
+      .prepare(
+        `DELETE FROM locations WHERE id NOT IN
+         (SELECT id FROM locations ORDER BY tst DESC, id DESC LIMIT ?)`,
+      )
+      .bind(keep),
+  );
+  let results: D1Result<unknown>[];
+  try {
+    results = await db.batch(stmts);
+  } catch {
+    return null;
+  }
+  const fired: FiredEvent[] = [];
+  for (const [idx, f] of fireAt) {
+    if ((results[idx]!.meta?.changes ?? 0) > 0) fired.push(f);
+  }
+  return fired;
 }
 
 // Recompute last_state from the latest location after a geometry edit,

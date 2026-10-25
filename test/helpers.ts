@@ -3,7 +3,12 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { Env } from "../src/env";
 
-export class FakeD1 implements Pick<D1Database, "prepare"> {
+interface FakeStmt extends D1PreparedStatement {
+  __sql: string;
+  __bound: unknown[];
+}
+
+export class FakeD1 implements Pick<D1Database, "prepare" | "batch"> {
   private db: DatabaseSync;
 
   constructor() {
@@ -19,6 +24,10 @@ export class FakeD1 implements Pick<D1Database, "prepare"> {
     const db = this.db;
     let bound: unknown[] = [];
     const stmt = {
+      __sql: sql,
+      get __bound() {
+        return bound;
+      },
       bind(...args: unknown[]) {
         bound = args;
         return stmt;
@@ -27,7 +36,10 @@ export class FakeD1 implements Pick<D1Database, "prepare"> {
         const r = db.prepare(sql).run(...(bound as never[]));
         return {
           success: true,
-          meta: { changes: Number(r.changes) },
+          meta: {
+            changes: Number(r.changes),
+            last_row_id: Number(r.lastInsertRowid),
+          },
           results: [],
         };
       },
@@ -46,6 +58,31 @@ export class FakeD1 implements Pick<D1Database, "prepare"> {
       },
     };
     return stmt as unknown as D1PreparedStatement;
+  }
+
+  async batch<T = unknown>(
+    stmts: D1PreparedStatement[],
+  ): Promise<D1Result<T>[]> {
+    this.db.exec("BEGIN");
+    const out: D1Result<T>[] = [];
+    try {
+      for (const s of stmts as FakeStmt[]) {
+        const r = this.db.prepare(s.__sql).run(...(s.__bound as never[]));
+        out.push({
+          success: true,
+          results: [] as T[],
+          meta: {
+            changes: Number(r.changes),
+            last_row_id: Number(r.lastInsertRowid),
+          } as D1Result<T>["meta"],
+        });
+      }
+      this.db.exec("COMMIT");
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
+    return out;
   }
 }
 
