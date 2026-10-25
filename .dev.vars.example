@@ -1,0 +1,8 @@
+# Copy to .dev.vars for `wrangler dev`. Set on the deployed worker with `wrangler secret put <NAME>`.
+
+# Password for the admin web app and the OAuth consent screen.
+ADMIN_PASSWORD=change-me
+
+# Basic-auth credentials the OwnTracks app uses when POSTing to /pub.
+OWTRACKS_USER=owntracks
+OWTRACKS_PASSWORD=change-me
