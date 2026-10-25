@@ -480,8 +480,20 @@ export async function evalAndStore(
   let results: D1Result<unknown>[];
   try {
     results = await db.batch(stmts);
-  } catch {
-    return null;
+  } catch (e) {
+    // The only expected failure is the stale-guard abort; confirm by
+    // re-reading last_tst. Anything else is a real error: release the
+    // eval_fixes claim so a retry can evaluate, then surface the failure
+    // (/pub 500 -> OwnTracks retries the upload).
+    const cur = await db
+      .prepare("SELECT value FROM meta WHERE key = 'last_tst'")
+      .first<{ value: number }>();
+    if (cur && cur.value > loc.tst) return null;
+    await db
+      .prepare("DELETE FROM eval_fixes WHERE id = ?")
+      .bind(evalId)
+      .run();
+    throw e;
   }
   const fired: FiredEvent[] = [];
   for (const [idx, f] of fireAt) {

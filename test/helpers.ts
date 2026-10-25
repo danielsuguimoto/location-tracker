@@ -10,6 +10,7 @@ interface FakeStmt extends D1PreparedStatement {
 
 export class FakeD1 implements Pick<D1Database, "prepare" | "batch"> {
   private db: DatabaseSync;
+  failNextBatch = false;
 
   constructor() {
     this.db = new DatabaseSync(":memory:");
@@ -63,6 +64,10 @@ export class FakeD1 implements Pick<D1Database, "prepare" | "batch"> {
   async batch<T = unknown>(
     stmts: D1PreparedStatement[],
   ): Promise<D1Result<T>[]> {
+    if (this.failNextBatch) {
+      this.failNextBatch = false;
+      throw new Error("simulated batch failure");
+    }
     this.db.exec("BEGIN");
     const out: D1Result<T>[] = [];
     try {

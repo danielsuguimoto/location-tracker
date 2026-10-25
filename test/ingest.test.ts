@@ -326,6 +326,42 @@ describe("POST /pub", () => {
     expect(latest!.lat).toBe(37.7749);
   });
 
+  it("releases the eval claim on batch failure so a retry fires", async () => {
+    const auth = basicAuth("owntracks", "test-owntracks-password");
+    const hook = await createWebhook(env.DB, {
+      client_id: "test-client",
+      label: "test",
+      url: "https://hooks.example/abc",
+      token: null,
+    });
+    const fence = await createGeofence(env.DB, {
+      client_id: "test-client",
+      name: "home",
+      lat: 37.7749,
+      lon: -122.4194,
+      radius_m: 500,
+      on_enter: true,
+      on_exit: true,
+      webhook_id: hook.id,
+    });
+    const post = (lat: number, lon: number, tst: number) =>
+      handleIngest(req(locationBody({ lat, lon, tst }), auth), env, ctx);
+
+    await post(37.9, -122.4194, 2000); // baseline outside
+    db.failNextBatch = true;
+    await expect(post(37.7749, -122.4194, 2001)).rejects.toThrow(
+      "simulated batch failure",
+    );
+    // Retry of the same fix re-evaluates instead of being dropped as replay.
+    await post(37.7749, -122.4194, 2001);
+    await Promise.all(ctx.awaited);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(
+      JSON.parse(String(fetchSpy.mock.calls[0]![1]!.body)).event,
+    ).toBe("enter");
+    expect((await getGeofence(env.DB, fence.id))!.last_state).toBe("inside");
+  });
+
   it("ignores out-of-range coordinates and non-positive tst", async () => {
     const auth = basicAuth("owntracks", "test-owntracks-password");
     for (const body of [
