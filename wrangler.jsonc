@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "location-tracker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-16",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "location-tracker-db",
+      "database_id": "a7cb162e-a095-4a80-a490-b8e154be0a36"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "18d8bcb6fb8a45a787413affcb6e2112",
+      "preview_id": "cadcb2146a9d47c494c87c311d840c21"
+    }
+  ],
+  "vars": {
+    "HISTORY_SIZE": "10"
+  }
+}

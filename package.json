@@ -1,0 +1,30 @@
+{
+  "name": "location-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "db:create": "wrangler d1 create location-tracker-db",
+    "db:migrate": "wrangler d1 execute location-tracker-db --remote --file schema.sql",
+    "db:migrate:local": "wrangler d1 execute location-tracker-db --local --file schema.sql"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "1.2.3",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@modelcontextprotocol/server": "2.3.1",
+    "agents": "0.28.1",
+    "hono": "4.13.13",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261016.1",
+    "@types/node": "^26.6.5",
+    "typescript": "~5.9.3",
+    "vitest": "5.0.5",
+    "wrangler": "4.151.1"
+  }
+}
