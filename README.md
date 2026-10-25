@@ -58,7 +58,7 @@ Point the client at `https://<your-worker>.workers.dev/mcp`. It will run the OAu
 | `update_geofence` / `unregister_geofence` | Patch / delete a subscription (owner client only) |
 | `test_geofence_notification` | Sends a `test` event to the webhook, returns delivery result |
 
-Scopes: `location:read`, `geofence:write`. Subscriptions are scoped to the OAuth `client_id` that created them; the admin UI manages all.
+Scopes: `location:read` gates the location tools, `geofence:write` gates all webhook/geofence tools — a client without a granted scope gets an `insufficient scope` error. Geofences **and webhook endpoints** are scoped to the OAuth `client_id` that created them; the admin UI manages all endpoints, which stay invisible to MCP clients. `webhook_url` values must be public HTTPS (private IPs, localhost, and cloud-metadata hosts are rejected).
 
 ## Notifications (Poke-compatible)
 
@@ -78,11 +78,11 @@ On a state transition the worker POSTs to the endpoint:
 
 `Authorization: Bearer <token>` is sent when the endpoint has a token. To reach a **Poke** agent, create a trigger with Poke's `create_webhook` and register its `webhookUrl` + `webhookToken` as an endpoint. Any other HTTPS endpoint works too.
 
-Semantics: the first location observed after registration sets the baseline state and does **not** fire (use `initial_state` instead); subsequent inside↔outside flips fire once each. One delivery attempt per event, 5 s timeout, every attempt logged to the `deliveries` table (last 200 kept).
+Semantics: the first location observed after registration sets the baseline state and does **not** fire (use `initial_state` instead); subsequent inside↔outside flips fire once each — state is claimed with an atomic compare-and-set, so overlapping uploads can't double-fire. Uploads are ordered by the device-reported `tst`: an out-of-order replay (queued fix arriving late) is stored in history but doesn't become "current" or move geofence state. Editing a geofence's circle re-baselines `last_state` from the latest location, so boundary changes never fire movement events. One delivery attempt per event, 5 s timeout, every attempt logged to the `deliveries` table (last 200 kept).
 
 ## Admin app
 
-`https://<your-worker>.workers.dev/admin` — sign in with `ADMIN_PASSWORD` (HMAC session cookie, 7 days, `__Host-` `Secure` `SameSite=Lax`). Dashboard, recent locations, **webhook endpoint registry**, geofence CRUD + test-fire, delivery log, and a `/admin/setup` page with copy-paste instructions. A webhook can't be deleted while geofences still reference it.
+`https://<your-worker>.workers.dev/admin` — sign in with `ADMIN_PASSWORD` (HMAC session cookie, 7 days, `__Host-` `Secure` `SameSite=Lax`). Login attempts are throttled per source IP (5 failures → 15 min lockout via KV), and all POSTs check `Origin` against the request host. Dashboard, recent locations, **webhook endpoint registry**, geofence CRUD + test-fire, delivery log, and a `/admin/setup` page with copy-paste instructions. A webhook can't be deleted while geofences still reference it.
 
 ## Notes / limits
 

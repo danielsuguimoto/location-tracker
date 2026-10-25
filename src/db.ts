@@ -1,5 +1,5 @@
 import type { LocationUpdate } from "./owntracks";
-import type { GeofenceState } from "./geo";
+import { haversineMeters, type GeofenceState } from "./geo";
 
 export interface LocationRow {
   id: number;
@@ -18,6 +18,7 @@ export interface LocationRow {
 
 export interface WebhookRow {
   id: string;
+  client_id: string;
   label: string;
   url: string;
   token: string | null;
@@ -94,7 +95,9 @@ export async function latestLocation(
   db: D1Database,
 ): Promise<LocationRow | null> {
   return db
-    .prepare(`SELECT ${LOCATION_COLS} FROM locations ORDER BY id DESC LIMIT 1`)
+    .prepare(
+      `SELECT ${LOCATION_COLS} FROM locations ORDER BY tst DESC, id DESC LIMIT 1`,
+    )
     .first<LocationRow>();
 }
 
@@ -104,23 +107,41 @@ export async function listLocations(
 ): Promise<LocationRow[]> {
   const { results } = await db
     .prepare(
-      `SELECT ${LOCATION_COLS} FROM locations ORDER BY id DESC LIMIT ?`,
+      `SELECT ${LOCATION_COLS} FROM locations ORDER BY tst DESC, id DESC LIMIT ?`,
     )
     .bind(limit)
     .all<LocationRow>();
   return results;
 }
 
+export async function claimLatestTst(
+  db: D1Database,
+  tst: number,
+): Promise<boolean> {
+  await db
+    .prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('last_tst', 0)")
+    .run();
+  const { meta } = await db
+    .prepare(
+      "UPDATE meta SET value = ? WHERE key = 'last_tst' AND value < ?",
+    )
+    .bind(tst, tst)
+    .run();
+  return (meta.changes ?? 0) > 0;
+}
+
+const WEBHOOK_COLS = "id, client_id, label, url, token, created_at";
+
 export async function createWebhook(
   db: D1Database,
-  w: { label: string; url: string; token: string | null },
+  w: { client_id: string; label: string; url: string; token: string | null },
 ): Promise<WebhookRow> {
   const id = crypto.randomUUID();
   await db
     .prepare(
-      "INSERT INTO webhooks (id, label, url, token) VALUES (?, ?, ?, ?)",
+      `INSERT INTO webhooks (id, client_id, label, url, token) VALUES (?, ?, ?, ?, ?)`,
     )
-    .bind(id, w.label, w.url, w.token)
+    .bind(id, w.client_id, w.label, w.url, w.token)
     .run();
   return (await getWebhook(db, id))!;
 }
@@ -130,42 +151,52 @@ export async function getWebhook(
   id: string,
 ): Promise<WebhookRow | null> {
   return db
-    .prepare("SELECT id, label, url, token, created_at FROM webhooks WHERE id = ?")
+    .prepare(`SELECT ${WEBHOOK_COLS} FROM webhooks WHERE id = ?`)
     .bind(id)
     .first<WebhookRow>();
 }
 
 export async function findWebhookByUrlToken(
   db: D1Database,
+  clientId: string,
   url: string,
   token: string | null,
 ): Promise<WebhookRow | null> {
   return db
     .prepare(
-      `SELECT id, label, url, token, created_at FROM webhooks
-       WHERE url = ? AND (token = ? OR (token IS NULL AND ? IS NULL))`,
+      `SELECT ${WEBHOOK_COLS} FROM webhooks
+       WHERE client_id = ? AND url = ? AND (token = ? OR (token IS NULL AND ? IS NULL))`,
     )
-    .bind(url, token, token)
+    .bind(clientId, url, token, token)
     .first<WebhookRow>();
 }
 
 export async function getOrCreateWebhook(
   db: D1Database,
+  clientId: string,
   url: string,
   token: string | null,
 ): Promise<WebhookRow> {
-  const existing = await findWebhookByUrlToken(db, url, token);
+  const existing = await findWebhookByUrlToken(db, clientId, url, token);
   if (existing) return existing;
   const host = new URL(url).host;
-  return createWebhook(db, { label: `${host} (auto)`, url, token });
+  return createWebhook(db, {
+    client_id: clientId,
+    label: `${host} (auto)`,
+    url,
+    token,
+  });
 }
 
-export async function listWebhooks(db: D1Database): Promise<WebhookRow[]> {
-  const { results } = await db
-    .prepare(
-      "SELECT id, label, url, token, created_at FROM webhooks ORDER BY created_at DESC",
-    )
-    .all<WebhookRow>();
+export async function listWebhooks(
+  db: D1Database,
+  clientId?: string,
+): Promise<WebhookRow[]> {
+  const sql = clientId
+    ? `SELECT ${WEBHOOK_COLS} FROM webhooks WHERE client_id = ? ORDER BY created_at DESC`
+    : `SELECT ${WEBHOOK_COLS} FROM webhooks ORDER BY created_at DESC`;
+  const stmt = db.prepare(sql);
+  const { results } = await (clientId ? stmt.bind(clientId) : stmt).all<WebhookRow>();
   return results;
 }
 
@@ -313,22 +344,52 @@ export async function deleteGeofence(
 export async function setGeofenceState(
   db: D1Database,
   id: string,
-  state: GeofenceState,
-  firedAt: number | null,
+  state: GeofenceState | null,
 ): Promise<void> {
-  if (firedAt === null) {
-    await db
-      .prepare("UPDATE geofences SET last_state = ? WHERE id = ?")
-      .bind(state, id)
-      .run();
-  } else {
-    await db
-      .prepare(
-        "UPDATE geofences SET last_state = ?, last_fired_at = ? WHERE id = ?",
-      )
-      .bind(state, firedAt, id)
-      .run();
-  }
+  await db
+    .prepare("UPDATE geofences SET last_state = ? WHERE id = ?")
+    .bind(state, id)
+    .run();
+}
+
+// Compare-and-set: updates only while last_state still equals `previous`
+// (IS = null-safe equality), so concurrent ingests can't double-fire.
+export async function casGeofenceState(
+  db: D1Database,
+  id: string,
+  previous: GeofenceState | null,
+  next: GeofenceState,
+  firedAt: number | null,
+): Promise<boolean> {
+  const sql = firedAt === null
+    ? "UPDATE geofences SET last_state = ? WHERE id = ? AND last_state IS ?"
+    : "UPDATE geofences SET last_state = ?, last_fired_at = ? WHERE id = ? AND last_state IS ?";
+  const args = firedAt === null
+    ? [next, id, previous]
+    : [next, firedAt, id, previous];
+  const { meta } = await db
+    .prepare(sql)
+    .bind(...args)
+    .run();
+  return (meta.changes ?? 0) > 0;
+}
+
+// Recompute last_state from the latest location after a geometry edit,
+// without firing. No recorded location -> reset to baseline (null).
+export async function rebaselineGeofence(
+  db: D1Database,
+  fence: GeofenceRow,
+): Promise<void> {
+  const latest = await latestLocation(db);
+  const inside = latest
+    ? haversineMeters(latest.lat, latest.lon, fence.lat, fence.lon) <=
+      fence.radius_m
+    : null;
+  await setGeofenceState(
+    db,
+    fence.id,
+    inside === null ? null : inside ? "inside" : "outside",
+  );
 }
 
 export async function insertDelivery(

@@ -1,3 +1,5 @@
+import type { Env } from "./env";
+
 const COOKIE_NAME = "__Host-lt";
 const MAX_AGE_SECONDS = 7 * 24 * 60 * 60;
 
@@ -72,4 +74,50 @@ export async function checkPassword(
 ): Promise<boolean> {
   if (!candidate || !secret) return false;
   return safeEqual(candidate, secret);
+}
+
+// Cross-site POSTs carry a different origin (or none); allow absent Origin so
+// non-browser clients still work, reject mismatching ones.
+export function originAllowed(request: Request): boolean {
+  const origin = request.headers.get("Origin");
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === new URL(request.url).host;
+  } catch {
+    return false;
+  }
+}
+
+const LOGIN_FAIL_PREFIX = "login-fail:";
+const LOGIN_FAIL_LIMIT = 5;
+const LOGIN_BLOCK_SECONDS = 15 * 60;
+
+export function clientIp(request: Request): string {
+  return request.headers.get("CF-Connecting-IP") ?? "unknown";
+}
+
+export async function loginBlocked(
+  env: Env,
+  ip: string,
+): Promise<boolean> {
+  const v = await env.OAUTH_KV.get(LOGIN_FAIL_PREFIX + ip);
+  return v !== null && Number(v) >= LOGIN_FAIL_LIMIT;
+}
+
+export async function recordLoginFailure(
+  env: Env,
+  ip: string,
+): Promise<void> {
+  const key = LOGIN_FAIL_PREFIX + ip;
+  const fails = Number(await env.OAUTH_KV.get(key)) + 1;
+  await env.OAUTH_KV.put(key, String(fails), {
+    expirationTtl: LOGIN_BLOCK_SECONDS,
+  });
+}
+
+export async function clearLoginFailures(
+  env: Env,
+  ip: string,
+): Promise<void> {
+  await env.OAUTH_KV.delete(LOGIN_FAIL_PREFIX + ip);
 }

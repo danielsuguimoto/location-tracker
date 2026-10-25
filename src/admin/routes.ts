@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { Env } from "../env";
 import { historySize } from "../env";
-import { verifySession } from "../session";
+import { verifySession, originAllowed } from "../session";
 import {
   latestLocation,
   listLocations,
@@ -16,7 +16,9 @@ import {
   createWebhook,
   updateWebhook,
   deleteWebhook,
+  rebaselineGeofence,
 } from "../db";
+import { webhookUrlError } from "../url";
 import { haversineMeters } from "../geo";
 import { deliverEvent } from "../notify";
 import { esc, page, htmlResponse } from "./views";
@@ -27,6 +29,9 @@ const ts = (sec: number | null) =>
 export const admin = new Hono<{ Bindings: Env }>();
 
 admin.use("/*", async (c, next) => {
+  if (c.req.method !== "GET" && !originAllowed(c.req.raw)) {
+    return new Response("Forbidden", { status: 403 });
+  }
   const ok = await verifySession(
     c.req.header("Cookie") ?? null,
     c.env.ADMIN_PASSWORD,
@@ -205,6 +210,7 @@ admin.post("/geofences/:id/update", async (c) => {
   ) {
     return new Response("Invalid input", { status: 400 });
   }
+  const geometryChanged = lat !== r.lat || lon !== r.lon || radius !== r.radius_m;
   await updateGeofence(c.env.DB, r.id, {
     name: String(f.name).trim().slice(0, 100),
     lat,
@@ -214,6 +220,10 @@ admin.post("/geofences/:id/update", async (c) => {
     on_enter: f.on_enter === "on",
     on_exit: f.on_exit === "on",
   });
+  if (geometryChanged) {
+    const moved = await getGeofence(c.env.DB, r.id);
+    if (moved) await rebaselineGeofence(c.env.DB, moved);
+  }
   return c.redirect("/admin/geofences");
 });
 
@@ -270,10 +280,11 @@ admin.post("/webhooks", async (c) => {
   const f = await c.req.parseBody();
   const url = String(f.url ?? "");
   const label = String(f.label ?? "").trim().slice(0, 100);
-  if (!label || !url.startsWith("https:")) {
+  if (!label || webhookUrlError(url)) {
     return new Response("Invalid input", { status: 400 });
   }
   await createWebhook(c.env.DB, {
+    client_id: "admin",
     label,
     url,
     token: String(f.token ?? "").trim() || null,
@@ -304,7 +315,7 @@ admin.post("/webhooks/:id/update", async (c) => {
   const f = await c.req.parseBody();
   const url = String(f.url ?? "");
   const label = String(f.label ?? "").trim().slice(0, 100);
-  if (!label || !url.startsWith("https:")) {
+  if (!label || webhookUrlError(url)) {
     return new Response("Invalid input", { status: 400 });
   }
   await updateWebhook(c.env.DB, w.id, {

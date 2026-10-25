@@ -5,7 +5,8 @@ import {
   insertLocation,
   pruneLocations,
   listGeofences,
-  setGeofenceState,
+  casGeofenceState,
+  claimLatestTst,
 } from "./db";
 import { haversineMeters, transitionEvent, type GeofenceState } from "./geo";
 import { deliverEvent } from "./notify";
@@ -67,25 +68,33 @@ export async function handleIngest(
   await insertLocation(env.DB, loc);
   await pruneLocations(env.DB, historySize(env));
 
-  const fences = await listGeofences(env.DB);
-  const firedAt = Math.floor(Date.now() / 1000);
-  for (const fence of fences) {
-    const inside =
-      haversineMeters(loc.lat, loc.lon, fence.lat, fence.lon) <=
-      fence.radius_m;
-    const current: GeofenceState = inside ? "inside" : "outside";
-    const event = transitionEvent(fence.last_state, current);
-    const wants =
-      event === "enter" ? fence.on_enter === 1 : fence.on_exit === 1;
-    await setGeofenceState(
-      env.DB,
-      fence.id,
-      current,
-      event && wants ? firedAt : null,
-    );
-    if (event && wants) {
-      const fenceCopy = { ...fence, last_state: current };
-      ctx.waitUntil(deliverEvent(env, fenceCopy, event, loc));
+  // Stale/duplicate uploads (replays, out-of-order queued fixes) are kept in
+  // history but must not move "current" location or geofence state. The CAS
+  // on meta.last_tst also serializes concurrent ingests: losers see no change.
+  const isNewest = await claimLatestTst(env.DB, loc.tst);
+  if (isNewest) {
+    const fences = await listGeofences(env.DB);
+    const firedAt = Math.floor(Date.now() / 1000);
+    for (const fence of fences) {
+      const inside =
+        haversineMeters(loc.lat, loc.lon, fence.lat, fence.lon) <=
+        fence.radius_m;
+      const current: GeofenceState = inside ? "inside" : "outside";
+      const event = transitionEvent(fence.last_state, current);
+      if (event === null && fence.last_state !== null) continue;
+      const wants =
+        event === "enter" ? fence.on_enter === 1 : event === "exit" ? fence.on_exit === 1 : false;
+      const won = await casGeofenceState(
+        env.DB,
+        fence.id,
+        fence.last_state,
+        current,
+        event && wants ? firedAt : null,
+      );
+      if (won && event && wants) {
+        const fenceCopy = { ...fence, last_state: current };
+        ctx.waitUntil(deliverEvent(env, fenceCopy, event, loc));
+      }
     }
   }
   return EMPTY_FRIENDS();

@@ -4,7 +4,7 @@ import {
   type ConsentDescription,
 } from "@cloudflare/workers-oauth-provider";
 import type { Env } from "../env";
-import { verifySession } from "../session";
+import { verifySession, originAllowed } from "../session";
 import { esc } from "./views";
 
 const enc = new TextEncoder();
@@ -74,7 +74,11 @@ export async function handleAuthorize(
           userId: "jun",
           metadata: {},
           scope: authRequest.scope,
-          props: { userId: "jun", clientId: authRequest.clientId },
+          props: {
+            userId: "jun",
+            clientId: authRequest.clientId,
+            scope: authRequest.scope,
+          },
         });
         return Response.redirect(redirectTo, 302);
       }
@@ -88,6 +92,9 @@ export async function handleAuthorize(
     }
     if (request.method === "POST") {
       if (!authed) return new Response("Unauthorized", { status: 401 });
+      if (!originAllowed(request)) {
+        return new Response("Forbidden", { status: 403 });
+      }
       const form = await request.formData();
       const handle = String(form.get("handle") ?? "");
       if (form.get("decision") !== "approve") {
@@ -104,7 +111,11 @@ export async function handleAuthorize(
         userId: "jun",
         metadata: {},
         scope: approved.request.scope,
-        props: { userId: "jun", clientId: approved.request.clientId },
+        props: {
+          userId: "jun",
+          clientId: approved.request.clientId,
+          scope: approved.request.scope,
+        },
       });
       approved.headers.set("Location", redirectTo);
       return new Response(null, { status: 302, headers: approved.headers });

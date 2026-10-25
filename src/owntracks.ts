@@ -35,7 +35,16 @@ export function parseOwnTracksPayload(body: string): ParsedPayload {
   const lat = num(obj.lat);
   const lon = num(obj.lon);
   const tst = num(obj.tst);
-  if (lat === null || lon === null || tst === null) return { kind: "ignored" };
+  if (
+    lat === null ||
+    lon === null ||
+    tst === null ||
+    Math.abs(lat) > 90 ||
+    Math.abs(lon) > 180 ||
+    tst <= 0
+  ) {
+    return { kind: "ignored" };
+  }
   const device =
     typeof obj.tid === "string" && obj.tid
       ? obj.tid

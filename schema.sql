@@ -16,8 +16,16 @@ CREATE TABLE IF NOT EXISTS locations (
 
 CREATE INDEX IF NOT EXISTS idx_locations_id_desc ON locations(id DESC);
 
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO meta (key, value) VALUES ('last_tst', 0);
+
 CREATE TABLE IF NOT EXISTS webhooks (
   id TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
   label TEXT NOT NULL,
   url TEXT NOT NULL,
   token TEXT,

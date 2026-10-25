@@ -11,6 +11,7 @@ import {
   listGeofences,
   updateGeofence,
   deleteGeofence,
+  rebaselineGeofence,
   lastDeliveryForGeofences,
   listWebhooks,
   getWebhook,
@@ -21,6 +22,7 @@ import {
 } from "./db";
 import { haversineMeters } from "./geo";
 import { deliverEvent } from "./notify";
+import { webhookUrlError } from "./url";
 
 const httpsUrl = z.url().refine((v) => new URL(v).protocol === "https:", {
   message: "must be an https URL",
@@ -91,6 +93,25 @@ function clientId(): string {
   return typeof id === "string" && id ? id : "unknown";
 }
 
+function hasScope(need: string): boolean {
+  const scope = getMcpAuthContext()?.props?.scope;
+  return Array.isArray(scope) && scope.includes(need);
+}
+
+function scopeError(need: string) {
+  return text({ error: `insufficient scope: this tool requires '${need}'` });
+}
+
+// A client may only reference webhook endpoints it registered (via url+token
+// params); admin-managed endpoints stay invisible and unusable to MCP clients.
+async function clientWebhook(
+  env: Env,
+  id: string,
+): Promise<WebhookRow | null> {
+  const w = await getWebhook(env.DB, id);
+  return w && w.client_id === clientId() ? w : null;
+}
+
 export function createServer(env: Env): McpServer {
   const server = new McpServer({
     name: "location-tracker",
@@ -105,6 +126,7 @@ export function createServer(env: Env): McpServer {
       inputSchema: {},
     },
     async () => {
+      if (!hasScope("location:read")) return scopeError("location:read");
       const row = await latestLocation(env.DB);
       if (!row) {
         return text({ error: "no location recorded yet" });
@@ -129,6 +151,7 @@ export function createServer(env: Env): McpServer {
       },
     },
     async ({ limit }) => {
+      if (!hasScope("location:read")) return scopeError("location:read");
       const rows = await listLocations(env.DB, limit ?? historySize(env));
       return text({ locations: rows.map(locationJson) });
     },
@@ -138,11 +161,12 @@ export function createServer(env: Env): McpServer {
     "list_webhooks",
     {
       description:
-        "List registered webhook endpoints that geofence notifications can be delivered to. Webhooks are managed in the admin interface; reference one by id in register_geofence. Tokens are never returned.",
+        "List webhook endpoints registered by this MCP client (via webhook_url params). Reference one by id in register_geofence to reuse it. Tokens are never returned.",
       inputSchema: {},
     },
     async () => {
-      const rows = await listWebhooks(env.DB);
+      if (!hasScope("geofence:write")) return scopeError("geofence:write");
+      const rows = await listWebhooks(env.DB, clientId());
       return text({ webhooks: rows.map(webhookJson) });
     },
   );
@@ -151,7 +175,7 @@ export function createServer(env: Env): McpServer {
     "register_geofence",
     {
       description:
-        "Register for a notification when the tracked device enters or leaves a circular area. Deliveries go to a registered webhook endpoint: pass webhook_id from list_webhooks to reuse one, or pass webhook_url (+ optional webhook_token) which is deduplicated into the registry. Poke-compatible: a Poke webhookUrl + webhookToken pair works directly.",
+        "Register for a notification when the tracked device enters or leaves a circular area. Deliveries go to a webhook endpoint: pass webhook_id from list_webhooks to reuse one you registered, or pass webhook_url (+ optional webhook_token) which is deduplicated into your registry. Poke-compatible: a Poke webhookUrl + webhookToken pair works directly.",
       inputSchema: {
         name: z.string().min(1).max(100).describe("Place name, e.g. 'home'"),
         lat: z.number().min(-90).max(90),
@@ -178,13 +202,17 @@ export function createServer(env: Env): McpServer {
       },
     },
     async ({ name, lat, lon, radius_m, webhook_id, webhook_url, webhook_token, events }) => {
+      if (!hasScope("geofence:write")) return scopeError("geofence:write");
       let webhook: WebhookRow | null = null;
       if (webhook_id) {
-        webhook = await getWebhook(env.DB, webhook_id);
+        webhook = await clientWebhook(env, webhook_id);
         if (!webhook) return text({ error: "webhook_id not found; call list_webhooks" });
       } else if (webhook_url) {
+        const urlError = webhookUrlError(webhook_url);
+        if (urlError) return text({ error: `webhook_url: ${urlError}` });
         webhook = await getOrCreateWebhook(
           env.DB,
+          clientId(),
           webhook_url,
           webhook_token ?? null,
         );
@@ -225,13 +253,14 @@ export function createServer(env: Env): McpServer {
       inputSchema: {},
     },
     async () => {
+      if (!hasScope("geofence:write")) return scopeError("geofence:write");
       const rows = await listGeofences(env.DB, clientId());
       const lastDeliveries = await lastDeliveryForGeofences(
         env.DB,
         rows.map((r) => r.id),
       );
       const webhooks = new Map(
-        (await listWebhooks(env.DB)).map((w) => [w.id, w]),
+        (await listWebhooks(env.DB, clientId())).map((w) => [w.id, w]),
       );
       return text({
         geofences: rows.map((r) => ({
@@ -279,18 +308,21 @@ export function createServer(env: Env): McpServer {
       },
     },
     async ({ id, events, webhook_id, webhook_url, webhook_token, ...patch }) => {
+      if (!hasScope("geofence:write")) return scopeError("geofence:write");
       const existing = await getGeofence(env.DB, id);
       if (!existing || existing.client_id !== clientId()) {
         return text({ error: "geofence not found" });
       }
       let resolvedWebhookId = webhook_id;
       if (!resolvedWebhookId && webhook_url) {
+        const urlError = webhookUrlError(webhook_url);
+        if (urlError) return text({ error: `webhook_url: ${urlError}` });
         resolvedWebhookId = (
-          await getOrCreateWebhook(env.DB, webhook_url, webhook_token ?? null)
+          await getOrCreateWebhook(env.DB, clientId(), webhook_url, webhook_token ?? null)
         ).id;
       }
       if (resolvedWebhookId) {
-        const w = await getWebhook(env.DB, resolvedWebhookId);
+        const w = await clientWebhook(env, resolvedWebhookId);
         if (!w) return text({ error: "webhook_id not found" });
       }
       await updateGeofence(env.DB, id, {
@@ -300,6 +332,16 @@ export function createServer(env: Env): McpServer {
           ? { on_enter: events.includes("enter"), on_exit: events.includes("exit") }
           : {}),
       });
+      // Geometry edits invalidate last_state; rebaseline so the next upload
+      // doesn't emit a movement event caused only by the boundary change.
+      if (
+        patch.lat !== undefined ||
+        patch.lon !== undefined ||
+        patch.radius_m !== undefined
+      ) {
+        const moved = await getGeofence(env.DB, id);
+        if (moved) await rebaselineGeofence(env.DB, moved);
+      }
       const updated = await getGeofence(env.DB, id);
       const webhook = updated
         ? await getWebhook(env.DB, updated.webhook_id)
@@ -315,6 +357,7 @@ export function createServer(env: Env): McpServer {
       inputSchema: { id: z.string().uuid() },
     },
     async ({ id }) => {
+      if (!hasScope("geofence:write")) return scopeError("geofence:write");
       const existing = await getGeofence(env.DB, id);
       if (!existing || existing.client_id !== clientId()) {
         return text({ error: "geofence not found" });
@@ -332,6 +375,7 @@ export function createServer(env: Env): McpServer {
       inputSchema: { id: z.string().uuid() },
     },
     async ({ id }) => {
+      if (!hasScope("geofence:write")) return scopeError("geofence:write");
       const existing = await getGeofence(env.DB, id);
       if (!existing || existing.client_id !== clientId()) {
         return text({ error: "geofence not found" });

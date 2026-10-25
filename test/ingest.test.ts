@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { handleIngest } from "../src/ingest";
-import { createGeofence, createWebhook, listLocations, getGeofence, getOrCreateWebhook } from "../src/db";
+import { createGeofence, createWebhook, listLocations, getGeofence, getOrCreateWebhook, latestLocation } from "../src/db";
 import {
   FakeD1,
   makeEnv,
@@ -97,6 +97,7 @@ describe("POST /pub", () => {
   it("fires webhook on enter/exit transitions, not on first observation", async () => {
     const auth = basicAuth("owntracks", "test-owntracks-password");
     const hook = await createWebhook(env.DB, {
+      client_id: "test-client",
       label: "test",
       url: "https://hooks.example/abc",
       token: "tok123",
@@ -112,8 +113,9 @@ describe("POST /pub", () => {
       webhook_id: hook.id,
     });
 
+    let tst = 2000000;
     const post = (lat: number, lon: number) =>
-      handleIngest(req(locationBody({ lat, lon }), auth), env, ctx);
+      handleIngest(req(locationBody({ lat, lon, tst: ++tst }), auth), env, ctx);
 
     await post(37.7749, -122.4194); // first observation inside -> no fire
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -140,6 +142,7 @@ describe("POST /pub", () => {
   it("respects on_enter/on_exit filters", async () => {
     const auth = basicAuth("owntracks", "test-owntracks-password");
     const hook = await createWebhook(env.DB, {
+      client_id: "test-client",
       label: "test",
       url: "https://hooks.example/abc",
       token: null,
@@ -154,8 +157,9 @@ describe("POST /pub", () => {
       on_exit: true,
       webhook_id: hook.id,
     });
+    let tst = 2000000;
     const post = (lat: number, lon: number) =>
-      handleIngest(req(locationBody({ lat, lon }), auth), env, ctx);
+      handleIngest(req(locationBody({ lat, lon, tst: ++tst }), auth), env, ctx);
     await post(37.7749, -122.4194); // baseline inside
     await post(37.8, -122.4194); // exit fires
     await Promise.all(ctx.awaited);
@@ -167,13 +171,61 @@ describe("POST /pub", () => {
     ).toBe("exit");
   });
 
-  it("getOrCreateWebhook dedupes url+token into a shared endpoint", async () => {
-    const a = await getOrCreateWebhook(env.DB, "https://hooks.example/x", "t1");
-    const b = await getOrCreateWebhook(env.DB, "https://hooks.example/x", "t1");
-    const c = await getOrCreateWebhook(env.DB, "https://hooks.example/x", null);
-    const d = await getOrCreateWebhook(env.DB, "https://hooks.example/x", null);
+  it("getOrCreateWebhook dedupes per client on url+token", async () => {
+    const a = await getOrCreateWebhook(env.DB, "c1", "https://hooks.example/x", "t1");
+    const b = await getOrCreateWebhook(env.DB, "c1", "https://hooks.example/x", "t1");
+    const c = await getOrCreateWebhook(env.DB, "c1", "https://hooks.example/x", null);
+    const d = await getOrCreateWebhook(env.DB, "c1", "https://hooks.example/x", null);
+    const other = await getOrCreateWebhook(env.DB, "c2", "https://hooks.example/x", "t1");
     expect(a.id).toBe(b.id);
     expect(c.id).toBe(d.id);
     expect(a.id).not.toBe(c.id);
+    expect(other.id).not.toBe(a.id);
+  });
+
+  it("stores stale uploads but does not move state or fire", async () => {
+    const auth = basicAuth("owntracks", "test-owntracks-password");
+    const hook = await createWebhook(env.DB, {
+      client_id: "test-client",
+      label: "test",
+      url: "https://hooks.example/abc",
+      token: null,
+    });
+    const fence = await createGeofence(env.DB, {
+      client_id: "test-client",
+      name: "home",
+      lat: 37.7749,
+      lon: -122.4194,
+      radius_m: 500,
+      on_enter: true,
+      on_exit: true,
+      webhook_id: hook.id,
+    });
+    const post = (lat: number, lon: number, tst: number) =>
+      handleIngest(req(locationBody({ lat, lon, tst }), auth), env, ctx);
+
+    await post(37.7749, -122.4194, 3000); // baseline inside at tst=3000
+    // Queued older fix outside replays late: stored, but not "current".
+    await post(37.9, -122.4194, 1000);
+    const fenceRow = await getGeofence(env.DB, fence.id);
+    expect(fenceRow!.last_state).toBe("inside");
+    const latest = await latestLocation(env.DB);
+    expect(latest!.tst).toBe(3000);
+    expect(await listLocations(env.DB, 10)).toHaveLength(2);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("ignores out-of-range coordinates and non-positive tst", async () => {
+    const auth = basicAuth("owntracks", "test-owntracks-password");
+    for (const body of [
+      locationBody({ lat: 91 }),
+      locationBody({ lon: -181 }),
+      locationBody({ tst: 0 }),
+      locationBody({ tst: -5 }),
+    ]) {
+      const res = await handleIngest(req(body, auth), env, ctx);
+      expect(res.status).toBe(200);
+    }
+    expect(await listLocations(env.DB, 10)).toHaveLength(0);
   });
 });

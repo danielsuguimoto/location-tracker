@@ -9,6 +9,11 @@ import {
   signSessionValue,
   sessionCookieHeader,
   clearSessionCookieHeader,
+  originAllowed,
+  clientIp,
+  loginBlocked,
+  recordLoginFailure,
+  clearLoginFailures,
 } from "./session";
 import { admin } from "./admin/routes";
 import { handleAuthorize } from "./admin/consent";
@@ -44,13 +49,25 @@ app.post("/login", async (c) => {
   const form = await c.req.parseBody();
   const next = String(form.next ?? "/admin");
   const safeNext = next.startsWith("/") ? next : "/admin";
+  if (!originAllowed(c.req.raw)) {
+    return htmlResponse(loginPage(safeNext, "Forbidden"), 403);
+  }
+  const ip = clientIp(c.req.raw);
+  if (await loginBlocked(c.env, ip)) {
+    return htmlResponse(
+      loginPage(safeNext, "Too many attempts, try again later"),
+      429,
+    );
+  }
   const ok = await checkPassword(
     String(form.password ?? ""),
     c.env.ADMIN_PASSWORD,
   );
   if (!ok) {
+    await recordLoginFailure(c.env, ip);
     return htmlResponse(loginPage(safeNext, "Wrong password"), 401);
   }
+  await clearLoginFailures(c.env, ip);
   const value = await signSessionValue(
     c.env.ADMIN_PASSWORD,
     Math.floor(Date.now() / 1000),
