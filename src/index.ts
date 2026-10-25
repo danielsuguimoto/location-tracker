@@ -49,7 +49,7 @@ app.post("/login", async (c) => {
   const form = await c.req.parseBody();
   const next = String(form.next ?? "/admin");
   const safeNext = next.startsWith("/") ? next : "/admin";
-  if (!originAllowed(c.req.raw)) {
+  if (!originAllowed(c.req.raw, c.env)) {
     return htmlResponse(loginPage(safeNext, "Forbidden"), 403);
   }
   const ip = clientIp(c.req.raw);

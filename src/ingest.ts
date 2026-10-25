@@ -6,7 +6,7 @@ import {
   pruneLocations,
   listGeofences,
   casGeofenceState,
-  claimLatestTst,
+  claimEval,
 } from "./db";
 import { haversineMeters, transitionEvent, type GeofenceState } from "./geo";
 import { deliverEvent } from "./notify";
@@ -65,14 +65,15 @@ export async function handleIngest(
   if (parsed.kind !== "location") return EMPTY_FRIENDS();
 
   const loc = parsed.location;
+  // Decide before inserting: stale replays (older tst, or an identical fix
+  // re-sent) are kept in history but must not move "current" location or
+  // geofence state. The CAS on meta.last_tst also serializes concurrent
+  // ingests: losers see no change.
+  const evalThis = await claimEval(env.DB, loc.tst, loc.lat, loc.lon);
   await insertLocation(env.DB, loc);
   await pruneLocations(env.DB, historySize(env));
 
-  // Stale/duplicate uploads (replays, out-of-order queued fixes) are kept in
-  // history but must not move "current" location or geofence state. The CAS
-  // on meta.last_tst also serializes concurrent ingests: losers see no change.
-  const isNewest = await claimLatestTst(env.DB, loc.tst);
-  if (isNewest) {
+  if (evalThis) {
     const fences = await listGeofences(env.DB);
     const firedAt = Math.floor(Date.now() / 1000);
     for (const fence of fences) {

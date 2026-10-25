@@ -77,12 +77,17 @@ export async function checkPassword(
 }
 
 // Cross-site POSTs carry a different origin (or none); allow absent Origin so
-// non-browser clients still work, reject mismatching ones.
-export function originAllowed(request: Request): boolean {
+// non-browser clients still work. Compare against the configured public host
+// when set — a request Host can be attacker-controlled on deployments that
+// accept arbitrary hosts — otherwise fall back to the request host.
+export function originAllowed(request: Request, env: Env): boolean {
   const origin = request.headers.get("Origin");
   if (!origin) return true;
   try {
-    return new URL(origin).host === new URL(request.url).host;
+    const expected = env.PUBLIC_BASE_URL
+      ? new URL(env.PUBLIC_BASE_URL).host
+      : new URL(request.url).host;
+    return new URL(origin).host === expected;
   } catch {
     return false;
   }

@@ -29,7 +29,7 @@ const ts = (sec: number | null) =>
 export const admin = new Hono<{ Bindings: Env }>();
 
 admin.use("/*", async (c, next) => {
-  if (c.req.method !== "GET" && !originAllowed(c.req.raw)) {
+  if (c.req.method !== "GET" && !originAllowed(c.req.raw, c.env)) {
     return new Response("Forbidden", { status: 403 });
   }
   const ok = await verifySession(

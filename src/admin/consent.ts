@@ -92,7 +92,7 @@ export async function handleAuthorize(
     }
     if (request.method === "POST") {
       if (!authed) return new Response("Unauthorized", { status: 401 });
-      if (!originAllowed(request)) {
+      if (!originAllowed(request, env)) {
         return new Response("Forbidden", { status: 403 });
       }
       const form = await request.formData();

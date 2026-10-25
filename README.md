@@ -31,6 +31,8 @@ wrangler deploy
 
 Local dev: `cp .dev.vars.example .dev.vars`, fill in values, then `npm run dev` and `npm run db:migrate:local`.
 
+Upgrading a database created before webhook ownership was added? Run `wrangler d1 execute location-tracker-db --remote --file migrations/0001_webhooks_client_id.sql` once — it backfills `client_id = 'admin'` on existing endpoints.
+
 ## Configure the phone
 
 In the OwnTracks app (iOS/Android):

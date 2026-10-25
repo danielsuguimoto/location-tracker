@@ -85,7 +85,7 @@ export async function pruneLocations(
   await db
     .prepare(
       `DELETE FROM locations WHERE id NOT IN
-       (SELECT id FROM locations ORDER BY id DESC LIMIT ?)`,
+       (SELECT id FROM locations ORDER BY tst DESC, id DESC LIMIT ?)`,
     )
     .bind(keep)
     .run();
@@ -114,9 +114,14 @@ export async function listLocations(
   return results;
 }
 
-export async function claimLatestTst(
+// Decides whether an upload may update "current" location and geofence
+// state. Must run BEFORE insertLocation: an identical (tst,lat,lon) row
+// already stored means this is a replay, not a distinct same-second fix.
+export async function claimEval(
   db: D1Database,
   tst: number,
+  lat: number,
+  lon: number,
 ): Promise<boolean> {
   await db
     .prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('last_tst', 0)")
@@ -127,7 +132,18 @@ export async function claimLatestTst(
     )
     .bind(tst, tst)
     .run();
-  return (meta.changes ?? 0) > 0;
+  if ((meta.changes ?? 0) > 0) return true;
+  const row = await db
+    .prepare("SELECT value FROM meta WHERE key = 'last_tst'")
+    .first<{ value: number }>();
+  if (!row || row.value !== tst) return false;
+  const dup = await db
+    .prepare(
+      "SELECT id FROM locations WHERE tst = ? AND lat = ? AND lon = ? LIMIT 1",
+    )
+    .bind(tst, lat, lon)
+    .first();
+  return !dup;
 }
 
 const WEBHOOK_COLS = "id, client_id, label, url, token, created_at";
