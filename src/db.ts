@@ -645,9 +645,13 @@ export async function evalAndStore(
         );
         continue;
       }
+      // Mirrors the transition CAS post-state (last_state + last_fired_at +
+      // the event flag): a suppressed transition leaves last_fired_at alone,
+      // so a stale same-second stamp can't consume the action.
       const firedCond = `EXISTS (
         SELECT 1 FROM geofences g
-        WHERE g.id = geofence_actions.geofence_id AND g.last_fired_at = ?)`;
+        WHERE g.id = geofence_actions.geofence_id
+          AND g.last_state = ? AND g.last_fired_at = ? AND ${want})`;
       actionAt.set(stmts.length, { action, fireIdx, consume: true });
       if (action.schedule_type === "once") {
         stmts.push(
@@ -657,7 +661,7 @@ export async function evalAndStore(
                SET status = 'completed', last_triggered_at = ?, updated_at = ?
                WHERE id = ? AND status = 'active' AND ${firedCond}`,
             )
-            .bind(firedAt, firedAt, action.id, firedAt),
+            .bind(firedAt, firedAt, action.id, current, firedAt),
         );
       } else {
         stmts.push(
@@ -667,7 +671,7 @@ export async function evalAndStore(
                SET last_triggered_at = ?, updated_at = ?
                WHERE id = ? AND status = 'active' AND ${firedCond}`,
             )
-            .bind(firedAt, firedAt, action.id, firedAt),
+            .bind(firedAt, firedAt, action.id, current, firedAt),
         );
       }
     }

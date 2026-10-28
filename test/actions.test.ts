@@ -176,6 +176,43 @@ describe("geofence actions", () => {
     expect(remaining.map((a) => a.id)).toEqual([live.id]);
   });
 
+  it("does not consume a once action on a suppressed same-second transition", async () => {
+    const db2 = new FakeD1();
+    const env2 = makeEnv(db2);
+    const ctx2 = makeCtx();
+    const hook = await createWebhook(env2.DB, {
+      client_id: "test-client",
+      label: "test",
+      url: "https://hooks.example/abc",
+      token: null,
+    });
+    const fence = await createGeofence(env2.DB, {
+      client_id: "test-client",
+      name: "exit-only",
+      lat: 37.7749,
+      lon: -122.4194,
+      radius_m: 500,
+      on_enter: false,
+      on_exit: true,
+      webhook_id: hook.id,
+    });
+    const action = await createGeofenceAction(env2.DB, {
+      geofence_id: fence.id,
+      trigger: "enter",
+      message: "never delivered",
+      schedule_type: "once",
+      expires_at: null,
+    });
+    const post2 = (lat: number, lon: number) =>
+      handleIngest(req(locationBody({ lat, lon, tst: ++tst })), env2, ctx2);
+    await post2(37.7749, -122.4194); // baseline inside
+    await post2(37.9, -122.4194); // exit fires, stamps last_fired_at
+    await post2(37.7749, -122.4194); // enter suppressed (on_enter=0), same second
+    await Promise.all(ctx2.awaited);
+    expect(fetchSpy).toHaveBeenCalledTimes(1); // only the exit delivery
+    expect((await getGeofenceAction(env2.DB, action.id))!.status).toBe("active");
+  });
+
   it("sends a neutral, data-first payload with no prose message", async () => {
     await post(37.9, -122.4194); // baseline outside
     await post(37.7749, -122.4194); // enter
