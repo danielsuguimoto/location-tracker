@@ -1,5 +1,9 @@
 import type { LocationUpdate } from "./owntracks";
-import { haversineMeters, type GeofenceState } from "./geo";
+import {
+  haversineMeters,
+  type GeofenceEvent,
+  type GeofenceState,
+} from "./geo";
 
 export interface LocationRow {
   id: number;
@@ -38,6 +42,23 @@ export interface GeofenceRow {
   last_state: GeofenceState | null;
   last_fired_at: number | null;
   created_at: number;
+}
+
+export type ActionSchedule = "once" | "always" | "until";
+export type ActionStatus = "active" | "completed" | "expired";
+
+export interface GeofenceActionRow {
+  id: string;
+  geofence_id: string;
+  trigger: GeofenceEvent;
+  action_type: string;
+  message: string;
+  schedule_type: ActionSchedule;
+  expires_at: number | null;
+  status: ActionStatus;
+  last_triggered_at: number | null;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface DeliveryRow {
@@ -386,7 +407,12 @@ export async function deleteGeofence(
     .prepare("DELETE FROM geofences WHERE id = ?")
     .bind(id)
     .run();
-  return (meta.changes ?? 0) > 0;
+  if ((meta.changes ?? 0) === 0) return false;
+  await db
+    .prepare("DELETE FROM geofence_actions WHERE geofence_id = ?")
+    .bind(id)
+    .run();
+  return true;
 }
 
 export async function setGeofenceState(
@@ -400,9 +426,127 @@ export async function setGeofenceState(
     .run();
 }
 
+const ACTION_COLS =
+  "id, geofence_id, trigger, action_type, message, schedule_type, expires_at, status, last_triggered_at, created_at, updated_at";
+
+export interface NewGeofenceAction {
+  geofence_id: string;
+  trigger: GeofenceEvent;
+  action_type?: string;
+  message: string;
+  schedule_type: ActionSchedule;
+  expires_at: number | null;
+}
+
+export async function createGeofenceAction(
+  db: D1Database,
+  a: NewGeofenceAction,
+): Promise<GeofenceActionRow> {
+  const id = crypto.randomUUID();
+  const now = Math.floor(Date.now() / 1000);
+  await db
+    .prepare(
+      `INSERT INTO geofence_actions
+       (id, geofence_id, trigger, action_type, message, schedule_type, expires_at, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+    )
+    .bind(
+      id,
+      a.geofence_id,
+      a.trigger,
+      a.action_type ?? "remind",
+      a.message,
+      a.schedule_type,
+      a.expires_at,
+      now,
+      now,
+    )
+    .run();
+  return (await getGeofenceAction(db, id))!;
+}
+
+export async function getGeofenceAction(
+  db: D1Database,
+  id: string,
+): Promise<GeofenceActionRow | null> {
+  return db
+    .prepare(`SELECT ${ACTION_COLS} FROM geofence_actions WHERE id = ?`)
+    .bind(id)
+    .first<GeofenceActionRow>();
+}
+
+export async function listGeofenceActions(
+  db: D1Database,
+  opts: { geofenceId?: string; clientId?: string; status?: ActionStatus } = {},
+): Promise<GeofenceActionRow[]> {
+  const now = Math.floor(Date.now() / 1000);
+  await db
+    .prepare(
+      `UPDATE geofence_actions SET status = 'expired', updated_at = ?
+       WHERE status = 'active' AND schedule_type = 'until'
+       AND expires_at IS NOT NULL AND expires_at <= ?`,
+    )
+    .bind(now, now)
+    .run();
+  const where: string[] = [];
+  const values: string[] = [];
+  if (opts.geofenceId) {
+    where.push("a.geofence_id = ?");
+    values.push(opts.geofenceId);
+  }
+  if (opts.clientId) {
+    where.push("g.client_id = ?");
+    values.push(opts.clientId);
+  }
+  if (opts.status) {
+    where.push("a.status = ?");
+    values.push(opts.status);
+  }
+  const { results } = await db
+    .prepare(
+      `SELECT ${ACTION_COLS.split(", ")
+        .map((c) => `a.${c}`)
+        .join(", ")} FROM geofence_actions a
+       JOIN geofences g ON g.id = a.geofence_id
+       ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+       ORDER BY a.created_at DESC`,
+    )
+    .bind(...values)
+    .all<GeofenceActionRow>();
+  return results;
+}
+
+export async function deleteGeofenceAction(
+  db: D1Database,
+  id: string,
+): Promise<boolean> {
+  const { meta } = await db
+    .prepare("DELETE FROM geofence_actions WHERE id = ?")
+    .bind(id)
+    .run();
+  return (meta.changes ?? 0) > 0;
+}
+
+async function activeActionsForFences(
+  db: D1Database,
+  fenceIds: string[],
+): Promise<GeofenceActionRow[]> {
+  if (fenceIds.length === 0) return [];
+  const placeholders = fenceIds.map(() => "?").join(",");
+  const { results } = await db
+    .prepare(
+      `SELECT ${ACTION_COLS} FROM geofence_actions
+       WHERE status = 'active' AND geofence_id IN (${placeholders})`,
+    )
+    .bind(...fenceIds)
+    .all<GeofenceActionRow>();
+  return results;
+}
+
 export interface FiredEvent {
   fence: GeofenceRow;
   event: "enter" | "exit";
+  actions: GeofenceActionRow[];
 }
 
 // Stores the fix and applies geofence transitions in ONE batch: D1 batches
@@ -429,7 +573,18 @@ export async function evalAndStore(
       .bind(loc.tst),
     insertLocationStmt(db, loc),
   ];
-  const fireAt = new Map<number, { fence: GeofenceRow; event: "enter" | "exit" }>();
+  const activeActions = await activeActionsForFences(
+    db,
+    fences.map((f) => f.id),
+  );
+  const fireAt = new Map<
+    number,
+    { fence: GeofenceRow; event: "enter" | "exit" }
+  >();
+  const actionAt = new Map<
+    number,
+    { action: GeofenceActionRow; fireIdx: number; consume: boolean }
+  >();
   for (const fence of fences) {
     const inside =
       haversineMeters(loc.lat, loc.lon, fence.lat, fence.lon) <=
@@ -448,6 +603,7 @@ export async function evalAndStore(
       fence: { ...fence, last_state: current },
       event: inside ? "enter" : "exit",
     });
+    const fireIdx = stmts.length;
     stmts.push(
       db
         .prepare(
@@ -462,6 +618,63 @@ export async function evalAndStore(
         )
         .bind(current, fence.id, opposite),
     );
+    // Action statements run after the transition CAS inside the same batch:
+    // gating consumption on last_fired_at = firedAt makes them no-ops unless
+    // this batch's transition actually fired, and status = 'active' makes a
+    // once action consumable exactly once across all concurrent evaluations.
+    for (const action of activeActions) {
+      if (action.geofence_id !== fence.id) continue;
+      if (action.trigger !== fireAt.get(fireIdx)!.event) continue;
+      if (
+        action.schedule_type === "until" &&
+        action.expires_at !== null &&
+        action.expires_at <= firedAt
+      ) {
+        actionAt.set(stmts.length, {
+          action,
+          fireIdx,
+          consume: false,
+        });
+        stmts.push(
+          db
+            .prepare(
+              `UPDATE geofence_actions SET status = 'expired', updated_at = ?
+               WHERE id = ? AND status = 'active'`,
+            )
+            .bind(firedAt, action.id),
+        );
+        continue;
+      }
+      // Mirrors the transition CAS post-state (last_state + last_fired_at +
+      // the event flag): a suppressed transition leaves last_fired_at alone,
+      // so a stale same-second stamp can't consume the action.
+      const firedCond = `EXISTS (
+        SELECT 1 FROM geofences g
+        WHERE g.id = geofence_actions.geofence_id
+          AND g.last_state = ? AND g.last_fired_at = ? AND ${want})`;
+      actionAt.set(stmts.length, { action, fireIdx, consume: true });
+      if (action.schedule_type === "once") {
+        stmts.push(
+          db
+            .prepare(
+              `UPDATE geofence_actions
+               SET status = 'completed', last_triggered_at = ?, updated_at = ?
+               WHERE id = ? AND status = 'active' AND ${firedCond}`,
+            )
+            .bind(firedAt, firedAt, action.id, current, firedAt),
+        );
+      } else {
+        stmts.push(
+          db
+            .prepare(
+              `UPDATE geofence_actions
+               SET last_triggered_at = ?, updated_at = ?
+               WHERE id = ? AND status = 'active' AND ${firedCond}`,
+            )
+            .bind(firedAt, firedAt, action.id, current, firedAt),
+        );
+      }
+    }
   }
   stmts.push(
     db
@@ -495,9 +708,24 @@ export async function evalAndStore(
       .run();
     throw e;
   }
+  const firedByIdx = new Map<number, FiredEvent>();
   const fired: FiredEvent[] = [];
   for (const [idx, f] of fireAt) {
-    if ((results[idx]!.meta?.changes ?? 0) > 0) fired.push(f);
+    if ((results[idx]!.meta?.changes ?? 0) > 0) {
+      const ev: FiredEvent = { ...f, actions: [] };
+      firedByIdx.set(idx, ev);
+      fired.push(ev);
+    }
+  }
+  for (const [idx, a] of actionAt) {
+    if (!a.consume) continue;
+    const ev = firedByIdx.get(a.fireIdx);
+    if (!ev || (results[idx]!.meta?.changes ?? 0) === 0) continue;
+    ev.actions.push({
+      ...a.action,
+      status: a.action.schedule_type === "once" ? "completed" : "active",
+      last_triggered_at: firedAt,
+    });
   }
   return fired;
 }

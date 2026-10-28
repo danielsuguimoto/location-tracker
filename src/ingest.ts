@@ -82,8 +82,8 @@ export async function handleIngest(
       await pruneLocations(env.DB, historySize(env));
       return EMPTY_FRIENDS();
     }
-    for (const { fence, event } of fired) {
-      ctx.waitUntil(deliverEvent(env, fence, event, loc));
+    for (const { fence, event, actions } of fired) {
+      ctx.waitUntil(deliverEvent(env, fence, event, loc, actions));
     }
   } else {
     await insertLocation(env.DB, loc);
