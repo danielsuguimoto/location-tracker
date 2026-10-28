@@ -5,7 +5,7 @@ A single Cloudflare Worker that:
 - Receives [OwnTracks](https://owntracks.org/booklet/) HTTP-mode location updates at `POST /pub` (HTTP Basic auth).
 - Stores them in D1, retaining only the `HISTORY_SIZE` most recent (default 10) to stay inside free-tier limits.
 - Serves a remote MCP server at `/mcp` (Streamable HTTP, OAuth 2.1 with dynamic client registration) exposing location and geofence tools.
-- Fires Poke-style webhook POSTs when the device enters or leaves agent-registered geofences.
+- Fires Poke-style webhook POSTs when the device enters or leaves agent-registered geofences, carrying any contextual reminder actions that fired with them.
 - Hosts a password-protected admin web app (`/admin`) for managing webhooks, viewing locations and delivery logs.
 
 ## Deploy
@@ -31,7 +31,7 @@ wrangler deploy
 
 Local dev: `cp .dev.vars.example .dev.vars`, fill in values, then `npm run dev` and `npm run db:migrate:local`.
 
-Upgrading a database created before webhook ownership was added? Run `wrangler d1 execute location-tracker-db --remote --file migrations/0001_webhooks_client_id.sql` once — it backfills `client_id = 'admin'` on existing endpoints.
+Upgrading an existing database? Apply any pending migrations in order — `wrangler d1 execute location-tracker-db --remote --file migrations/0001_webhooks_client_id.sql` (backfills `client_id = 'admin'` on existing endpoints), then `migrations/0002_geofence_actions.sql` (adds the `geofence_actions` table).
 
 ## Configure the phone
 
@@ -58,6 +58,9 @@ Point the client at `https://<your-worker>.workers.dev/mcp`. It will run the OAu
 | `register_geofence` | `name`, `lat`, `lon`, `radius_m`, `events` + either `webhook_id` (reuse a registered endpoint) or `webhook_url` + optional `webhook_token` (deduplicated into the registry) → `{id, initial_state, webhook}` |
 | `list_geofences` | Caller's subscriptions + state + last delivery |
 | `update_geofence` / `unregister_geofence` | Patch / delete a subscription (owner client only) |
+| `create_geofence_action` | Attach a reminder action to a geofence: `trigger` (`enter`/`exit`), `message`, `schedule_type` (`once`/`always`/`until`), `expires_at` (unix seconds or ISO 8601, required for `until`) |
+| `list_geofence_actions` | List actions on the caller's geofences (optionally one geofence or one status) |
+| `delete_geofence_action` | Delete an action (owner client only) |
 | `test_geofence_notification` | Sends a `test` event to the webhook, returns delivery result |
 
 Scopes: `location:read` gates the location tools, `geofence:write` gates all webhook/geofence tools — a client without a granted scope gets an `insufficient scope` error. Geofences **and webhook endpoints** are scoped to the OAuth `client_id` that created them; the admin UI manages all endpoints, which stay invisible to MCP clients. `webhook_url` values must be public HTTPS (private IPs, localhost, and cloud-metadata hosts are rejected).
@@ -73,14 +76,16 @@ On a state transition the worker POSTs to the endpoint:
   "event": "enter" | "exit" | "test",
   "geofence": {"id": "…", "name": "home", "lat": 0, "lon": 0, "radius_m": 200},
   "location": {"lat": 0, "lon": 0, "acc": 5, "tst": 0, "device": "JJ"},
-  "message": "Jun arrived at \"home\"",
+  "actions": [{"id": "…", "type": "remind", "message": "check the door", "schedule_type": "once"}],
   "timestamp": 0
 }
 ```
 
+The payload is neutral and data-first: no generated prose — `actions` carries the reminder `message` of every action this transition consumed (empty when none matched).
+
 `Authorization: Bearer <token>` is sent when the endpoint has a token. To reach a **Poke** agent, create a trigger with Poke's `create_webhook` and register its `webhookUrl` + `webhookToken` as an endpoint. Any other HTTPS endpoint works too.
 
-Semantics: the first location observed after registration sets the baseline state and does **not** fire (use `initial_state` instead); subsequent inside↔outside flips fire once each — each upload's store + transitions + eval marker commit in one atomic D1 batch, so overlapping uploads can't double-fire or desync "current" from geofence state. Uploads are ordered by the device-reported `tst`: an out-of-order fix (queued upload arriving late) is stored in history but doesn't become "current" or move geofence state, and an exact replay (same tst+coords) is dropped before storage. Editing a geofence's circle re-baselines `last_state` from the latest location, so boundary changes never fire movement events. One delivery attempt per event, 5 s timeout, every attempt logged to the `deliveries` table (last 200 kept).
+Semantics: the first location observed after registration sets the baseline state and does **not** fire events **or actions** (use `initial_state` instead); subsequent inside↔outside flips fire once each — each upload's store + transitions + action consumption + eval marker commit in one atomic D1 batch, so overlapping uploads can't double-fire or desync "current" from geofence state. Actions: `once` transitions to `completed` inside that same batch so it can never execute twice, `always` fires on every matching transition, and `until` fires while `now < expires_at` (overdue rows are marked `expired`). Uploads are ordered by the device-reported `tst`: an out-of-order fix (queued upload arriving late) is stored in history but doesn't become "current" or move geofence state, and an exact replay (same tst+coords) is dropped before storage. Editing a geofence's circle re-baselines `last_state` from the latest location, so boundary changes never fire movement events. One delivery attempt per event, 5 s timeout, every attempt logged to the `deliveries` table (last 200 kept).
 
 ## Admin app
 

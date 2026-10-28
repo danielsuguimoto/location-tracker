@@ -59,6 +59,22 @@ CREATE TABLE IF NOT EXISTS geofences (
 
 CREATE INDEX IF NOT EXISTS idx_geofences_client ON geofences(client_id);
 
+CREATE TABLE IF NOT EXISTS geofence_actions (
+  id TEXT PRIMARY KEY,
+  geofence_id TEXT NOT NULL REFERENCES geofences(id) ON DELETE CASCADE,
+  trigger TEXT NOT NULL CHECK (trigger IN ('enter', 'exit')),
+  action_type TEXT NOT NULL DEFAULT 'remind',
+  message TEXT NOT NULL,
+  schedule_type TEXT NOT NULL CHECK (schedule_type IN ('once', 'always', 'until')),
+  expires_at INTEGER,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'expired')),
+  last_triggered_at INTEGER,
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_geofence_actions_geofence ON geofence_actions(geofence_id, status);
+
 CREATE TABLE IF NOT EXISTS deliveries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   geofence_id TEXT NOT NULL,

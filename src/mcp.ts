@@ -12,12 +12,17 @@ import {
   updateGeofence,
   deleteGeofence,
   rebaselineGeofence,
+  createGeofenceAction,
+  getGeofenceAction,
+  listGeofenceActions,
+  deleteGeofenceAction,
   lastDeliveryForGeofences,
   listWebhooks,
   getWebhook,
   getOrCreateWebhook,
   type LocationRow,
   type GeofenceRow,
+  type GeofenceActionRow,
   type WebhookRow,
 } from "./db";
 import { haversineMeters } from "./geo";
@@ -75,6 +80,34 @@ function geofenceJson(row: GeofenceRow, webhook?: WebhookRow | null) {
     created_at: new Date(row.created_at * 1000).toISOString(),
   };
 }
+
+function geofenceActionJson(a: GeofenceActionRow) {
+  return {
+    id: a.id,
+    geofence_id: a.geofence_id,
+    trigger: a.trigger,
+    type: a.action_type,
+    message: a.message,
+    schedule_type: a.schedule_type,
+    expires_at: a.expires_at
+      ? new Date(a.expires_at * 1000).toISOString()
+      : null,
+    status: a.status,
+    last_triggered_at: a.last_triggered_at
+      ? new Date(a.last_triggered_at * 1000).toISOString()
+      : null,
+    created_at: new Date(a.created_at * 1000).toISOString(),
+  };
+}
+
+const expiresAtInput = z
+  .union([
+    z.number().int().positive().describe("Unix timestamp (seconds)"),
+    z.iso.datetime({ offset: true }).describe("ISO 8601 timestamp"),
+  ])
+  .transform((v) =>
+    typeof v === "number" ? v : Math.floor(new Date(v).getTime() / 1000),
+  );
 
 function text(result: unknown) {
   const structured =
@@ -363,6 +396,94 @@ export function createServer(env: Env): McpServer {
         return text({ error: "geofence not found" });
       }
       await deleteGeofence(env.DB, id);
+      return text({ deleted: id });
+    },
+  );
+
+  server.registerTool(
+    "create_geofence_action",
+    {
+      description:
+        "Attach a reminder action to a geofence you own. The action rides along in the geofence's webhook payload whenever the chosen trigger fires. schedule_type: 'once' fires a single time then completes, 'always' fires on every matching transition, 'until' fires until expires_at then expires.",
+      inputSchema: {
+        geofence_id: z.string().uuid().describe("Geofence id (from list_geofences)"),
+        trigger: z.enum(["enter", "exit"]),
+        message: z.string().min(1).max(500).describe("Reminder text delivered in the webhook payload"),
+        schedule_type: z.enum(["once", "always", "until"]),
+        expires_at: expiresAtInput
+          .optional()
+          .describe("Required for schedule_type 'until'"),
+      },
+    },
+    async ({ geofence_id, trigger, message, schedule_type, expires_at }) => {
+      if (!hasScope("geofence:write")) return scopeError("geofence:write");
+      const fence = await getGeofence(env.DB, geofence_id);
+      if (!fence || fence.client_id !== clientId()) {
+        return text({ error: "geofence not found" });
+      }
+      if (schedule_type === "until" && expires_at === undefined) {
+        return text({ error: "expires_at is required for schedule_type 'until'" });
+      }
+      const row = await createGeofenceAction(env.DB, {
+        geofence_id,
+        trigger,
+        message,
+        schedule_type,
+        expires_at: expires_at ?? null,
+      });
+      return text({ action: geofenceActionJson(row) });
+    },
+  );
+
+  server.registerTool(
+    "list_geofence_actions",
+    {
+      description:
+        "List reminder actions on geofences owned by this MCP client, optionally narrowed to one geofence or to active actions only.",
+      inputSchema: {
+        geofence_id: z
+          .string()
+          .uuid()
+          .optional()
+          .describe("Restrict to one geofence (must be yours)"),
+        status: z
+          .enum(["active", "completed", "expired"])
+          .optional()
+          .describe("Defaults to all statuses"),
+      },
+    },
+    async ({ geofence_id, status }) => {
+      if (!hasScope("geofence:write")) return scopeError("geofence:write");
+      if (geofence_id) {
+        const fence = await getGeofence(env.DB, geofence_id);
+        if (!fence || fence.client_id !== clientId()) {
+          return text({ error: "geofence not found" });
+        }
+      }
+      const rows = await listGeofenceActions(env.DB, {
+        geofenceId: geofence_id,
+        clientId: clientId(),
+        status,
+      });
+      return text({ actions: rows.map(geofenceActionJson) });
+    },
+  );
+
+  server.registerTool(
+    "delete_geofence_action",
+    {
+      description: "Delete a reminder action on a geofence owned by this MCP client.",
+      inputSchema: { id: z.string().uuid() },
+    },
+    async ({ id }) => {
+      if (!hasScope("geofence:write")) return scopeError("geofence:write");
+      const action = await getGeofenceAction(env.DB, id);
+      if (!action) return text({ error: "action not found" });
+      const fence = await getGeofence(env.DB, action.geofence_id);
+      if (!fence || fence.client_id !== clientId()) {
+        return text({ error: "action not found" });
+      }
+      await deleteGeofenceAction(env.DB, id);
       return text({ deleted: id });
     },
   );

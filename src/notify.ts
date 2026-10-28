@@ -1,5 +1,5 @@
 import type { Env } from "./env";
-import type { GeofenceRow, WebhookRow } from "./db";
+import type { GeofenceActionRow, GeofenceRow, WebhookRow } from "./db";
 import { getWebhook, insertDelivery, pruneDeliveries } from "./db";
 import type { GeofenceEvent } from "./geo";
 
@@ -15,6 +15,7 @@ export function buildEventPayload(
   fence: GeofenceRow,
   event: GeofenceEvent | "test",
   loc: EventLocation | null,
+  actions: GeofenceActionRow[] = [],
 ): Record<string, unknown> {
   return {
     event,
@@ -34,12 +35,12 @@ export function buildEventPayload(
           device: loc.device,
         }
       : null,
-    message:
-      event === "enter"
-        ? `Jun arrived at "${fence.name}"`
-        : event === "exit"
-          ? `Jun left "${fence.name}"`
-          : `Test notification for "${fence.name}"`,
+    actions: actions.map((a) => ({
+      id: a.id,
+      type: a.action_type,
+      message: a.message,
+      schedule_type: a.schedule_type,
+    })),
     timestamp: Math.floor(Date.now() / 1000),
   };
 }
@@ -49,8 +50,9 @@ export async function deliverEvent(
   fence: GeofenceRow,
   event: GeofenceEvent | "test",
   loc: EventLocation | null,
+  actions: GeofenceActionRow[] = [],
 ): Promise<{ status: number | null; error: string | null }> {
-  const payload = buildEventPayload(fence, event, loc);
+  const payload = buildEventPayload(fence, event, loc, actions);
   const body = JSON.stringify(payload);
   const webhook = await getWebhook(env.DB, fence.webhook_id);
   let status: number | null = null;
