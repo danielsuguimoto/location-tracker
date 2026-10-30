@@ -6,6 +6,7 @@ import {
 import type { Env } from "../env";
 import { verifySession, originAllowed } from "../session";
 import { esc } from "./views";
+import { DEFAULT_SCOPES } from "../scopes";
 
 const enc = new TextEncoder();
 
@@ -67,6 +68,9 @@ export async function handleAuthorize(
         );
       }
       const authRequest = await oauth.parseAuthRequest(request);
+      if (!authRequest.scope?.length) {
+        authRequest.scope = [...DEFAULT_SCOPES];
+      }
       const remember = { secret: await rememberSecret(env), subject: "jun" };
       if (await oauth.isConsentRemembered(request, authRequest, remember)) {
         const { redirectTo } = await oauth.completeAuthorization({

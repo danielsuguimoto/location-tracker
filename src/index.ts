@@ -18,6 +18,7 @@ import {
 import { admin } from "./admin/routes";
 import { handleAuthorize } from "./admin/consent";
 import { esc, htmlResponse } from "./admin/views";
+import { DEFAULT_SCOPES } from "./scopes";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -113,7 +114,7 @@ export default {
       authorizeEndpoint: "/authorize",
       tokenEndpoint: "/oauth/token",
       clientRegistrationEndpoint: "/oauth/register",
-      scopesSupported: ["location:read", "geofence:write"],
+      scopesSupported: DEFAULT_SCOPES,
       resourceMetadata: {
         resource: `${origin}/mcp`,
         resource_name: "location-tracker",
