@@ -48,6 +48,57 @@ Only `_type: "location"` payloads are stored; everything else gets `200 []`.
 
 Point the client at `https://<your-worker>.workers.dev/mcp`. It will run the OAuth flow; the `/authorize` consent page requires the admin password login. Approved grants issue bearer tokens (1 h access, 30 d refresh).
 
+### OAuth client authentication and refresh troubleshooting
+
+Client registration (`POST /oauth/register`) returns `client_id`, the effective
+`token_endpoint_auth_method`, and, for confidential clients, a `client_secret`.
+The client must persist these together and use the same identity for both code
+exchange and refresh at `/oauth/token`. If the method is omitted at registration,
+the provider defaults to `client_secret_basic`, **not** `none`.
+
+- `client_secret_basic`: send the issued ID and secret as HTTP Basic credentials
+  (form-encode each component before base64 encoding).
+- `client_secret_post`: send the issued ID and secret in the form body.
+- `none`: public client, no secret; authorization requires S256 PKCE.
+
+The Worker tolerates switching between Basic and POST **only for confidential
+clients supplying a nonempty secret**: it translates the transport to the client's
+registered method, then lets the OAuth provider validate the original secret,
+PKCE/code, refresh token, client binding, resource, scopes, expiry and revocation.
+It does not change stored registrations, bypass secrets, downgrade a confidential
+client to `none`, or strip credentials from a public client. Malformed, repeated or
+mixed authentication is left to the provider to reject.
+
+In provider **1.2.3** (also verified in the deployed Worker bundle), the exact error
+`invalid_client` / `Client authentication failed` comes from
+`parseTokenEndpointRequest` with reason `token_endpoint_auth_method_mismatch`:
+authentication fails **before** refresh-token validation. Explicit registrations
+enforce their method; the library's built-in Basic/POST compatibility only covers
+legacy/implicit registrations. A wrong secret, unknown client and expired refresh
+token have different descriptions/reasons. This establishes the method-mismatch
+failure class, but not the particular registered/presented pair in an individual
+incident without its client configuration or logs.
+
+OAuth failures now log only `code`, `status`, `category`, `reason` and allowlisted
+registered/presented methods. Never paste request bodies, Authorization headers,
+tokens, secrets or KV client records into logs or support messages.
+
+After deploying, an existing confidential client's valid credentials can refresh
+using either transport; no KV/D1 migration or new Worker secret is needed. If the
+client omitted/lost its issued secret, restore it **in the MCP client's OAuth
+credential store**, not in `ADMIN_PASSWORD` or a made-up Worker variable. If it
+cannot be recovered, reconnect/re-register and approve OAuth again. Public clients
+must register with `token_endpoint_auth_method: "none"` and must not send a secret.
+Retain the replacement refresh token after every successful refresh. Expired or
+revoked grants also require reauthorization; this compatibility does not revive
+them. Keep the production `OAUTH_KV` namespace unchanged across deployments.
+
+Re-registering normally creates a new `client_id`; existing geofences and webhooks
+remain owned by the old ID and must be reviewed/recreated for the new client (do
+not silently transfer ownership). The production client's stored credentials and
+refresh request were not accessible during this investigation, so a live refresh
+and `get_current_location` must still be checked after deployment/reconnection.
+
 ### Tools
 
 | Tool | Purpose |

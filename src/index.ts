@@ -1,4 +1,4 @@
-import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
+import { fetchOAuth } from "./oauth";
 import { createMcpHandler } from "agents/mcp/server";
 import { Hono } from "hono";
 import type { Env } from "./env";
@@ -100,7 +100,7 @@ app.notFound((c) => new Response("Not found", { status: 404 }));
 export default {
   fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const origin = env.PUBLIC_BASE_URL ?? new URL(request.url).origin;
-    const provider = new OAuthProvider<Env>({
+    return fetchOAuth(request, env, ctx, {
       apiRoute: "/mcp",
       apiHandler: {
         fetch: (req, e, c) =>
@@ -120,6 +120,5 @@ export default {
         resource_name: "location-tracker",
       },
     });
-    return provider.fetch(request, env, ctx);
   },
 } satisfies ExportedHandler<Env>;
