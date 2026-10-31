@@ -7,6 +7,7 @@ import type { Env } from "../env";
 import { verifySession, originAllowed } from "../session";
 import { esc } from "./views";
 import { DEFAULT_SCOPES } from "../scopes";
+import { clientMetadataUnavailable } from "../oauth";
 
 const enc = new TextEncoder();
 
@@ -129,15 +130,9 @@ export async function handleAuthorize(
     if (error instanceof AuthorizationError && error.redirectTo) {
       return Response.redirect(error.redirectTo, 302);
     }
-    if (
-      error instanceof AuthorizationError ||
-      error instanceof CimdFetchError
-    ) {
-      const message =
-        error instanceof AuthorizationError
-          ? error.description
-          : "This app could not be verified.";
-      return new Response(esc(message), {
+    if (error instanceof CimdFetchError) return clientMetadataUnavailable();
+    if (error instanceof AuthorizationError) {
+      return new Response(esc(error.description), {
         status: 400,
         headers: { "Content-Type": "text/plain; charset=utf-8" },
       });

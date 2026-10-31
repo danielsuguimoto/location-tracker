@@ -46,7 +46,7 @@ Only `_type: "location"` payloads are stored; everything else gets `200 []`.
 
 ## Connect an MCP client
 
-Point the client at `https://<your-worker>.workers.dev/mcp`. It will run the OAuth flow; the `/authorize` consent page requires the admin password login. Approved grants issue bearer tokens (1 h access, 30 d refresh).
+Point the client at `https://<your-worker>.workers.dev/mcp`. It will run the OAuth flow; the `/authorize` consent page requires the admin password login. Approved grants issue bearer tokens (1 h access, 30 d initial/idle refresh lifetime).
 
 ### OAuth client authentication and refresh troubleshooting
 
@@ -79,9 +79,42 @@ token have different descriptions/reasons. This establishes the method-mismatch
 failure class, but not the particular registered/presented pair in an individual
 incident without its client configuration or logs.
 
-OAuth failures now log only `code`, `status`, `category`, `reason` and allowlisted
-registered/presented methods. Never paste request bodies, Authorization headers,
-tokens, secrets or KV client records into logs or support messages.
+The application's structured OAuth diagnostics include only `code`, `status`,
+`category`, `reason` and allowlisted registered/presented methods. Never paste
+request bodies, Authorization headers, tokens, secrets or KV client records into
+logs or support messages.
+
+#### CIMD outages and refresh lifetime
+
+Like render-html, this Worker uses `@cloudflare/workers-oauth-provider` 1.2.3, but
+**CIMD is not enabled here**: `clientIdMetadataDocumentEnabled` defaults to false,
+the Worker has no `global_fetch_strictly_public` flag, and public discovery reports
+`client_id_metadata_document_supported: false`. Clients currently use DCR and KV
+registrations, not URL-fetched client metadata. This change preserves that setup;
+enabling CIMD separately requires both the provider option and the SSRF-protecting
+compatibility flag.
+
+For any CIMD-enabled use of the OAuth wrapper, only the provider's
+`client-id-metadata-document` / `metadata_resolution_failed` error is translated
+from `401 invalid_client` into **`503 temporarily_unavailable`**, with
+`Retry-After: 30` and `Cache-Control: no-store`. The same response is returned for
+`CimdFetchError` during the early compatibility lookup or authorization/consent,
+instead of a 500/400. Retry later with the **same credentials**. Failed resolution
+does not consume a code, rotate a refresh token, or renew a grant. No stale
+metadata or unverified client is accepted. The provider groups fetch errors and
+invalid metadata under this reason, so all remain unavailable until a valid
+document can be resolved. Genuine unknown clients, wrong secrets and method
+mismatches remain authentication errors; unrelated failures are not masked.
+
+`fetchOAuth` explicitly defaults both `refreshTokenTTL` and `refreshTokenIdleTTL`
+to **2,592,000 seconds (30 days)**. A new grant initially expires in 30 days; each
+successful refresh moves expiry to 30 days after that refresh, rather than keeping
+an absolute 30-day ceiling from authorization. Access tokens remain one hour, and
+rotation/replay protection, client binding, scope limits and revocation remain
+unchanged. Existing live grants adopt rolling expiry on their next successful
+refresh. Expired/deleted grants are not revived, and failed authentication does
+not extend the idle window. The provider's renewable 90-day DCR registrations are
+unchanged.
 
 After deploying, an existing confidential client's valid credentials can refresh
 using either transport; no KV/D1 migration or new Worker secret is needed. If the
@@ -89,7 +122,7 @@ client omitted/lost its issued secret, restore it **in the MCP client's OAuth
 credential store**, not in `ADMIN_PASSWORD` or a made-up Worker variable. If it
 cannot be recovered, reconnect/re-register and approve OAuth again. Public clients
 must register with `token_endpoint_auth_method: "none"` and must not send a secret.
-Retain the replacement refresh token after every successful refresh. Expired or
+Retain the replacement refresh token after every successful refresh. Idle-expired or
 revoked grants also require reauthorization; this compatibility does not revive
 them. Keep the production `OAUTH_KV` namespace unchanged across deployments.
 

@@ -1,10 +1,33 @@
 import {
+  CimdFetchError,
   OAuthProvider,
   getOAuthApi,
   type OAuthHelpers,
   type OAuthProviderOptions,
 } from "@cloudflare/workers-oauth-provider";
 import type { Env } from "./env";
+
+export const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+export function clientMetadataUnavailable(): Response {
+  console.warn("OAuth request rejected", {
+    code: "temporarily_unavailable",
+    status: 503,
+    category: "client-id-metadata-document",
+    reason: "metadata_resolution_failed",
+  });
+  return Response.json({
+    error: "temporarily_unavailable",
+    error_description: "Client metadata could not be verified. Retry later with the same credentials.",
+  }, {
+    status: 503,
+    headers: {
+      "Retry-After": "30",
+      "Cache-Control": "no-store",
+      Pragma: "no-cache",
+    },
+  });
+}
 
 type SecretMethod = "client_secret_basic" | "client_secret_post";
 
@@ -106,21 +129,36 @@ export async function fetchOAuth(
   ctx: ExecutionContext,
   options: OAuthProviderOptions<Env>,
 ): Promise<Response> {
-  const provider = new OAuthProvider({
+  const providerOptions: OAuthProviderOptions<Env> = {
+    refreshTokenTTL: REFRESH_TOKEN_TTL_SECONDS,
+    refreshTokenIdleTTL: REFRESH_TOKEN_TTL_SECONDS,
     ...options,
-    onError: options.onError ?? logOAuthError,
-  });
+    onError(error) {
+      if (error.code === "invalid_client" &&
+        error.internal.category === "client-id-metadata-document" &&
+        error.internal.reason === "metadata_resolution_failed") {
+        return clientMetadataUnavailable();
+      }
+      return (options.onError ?? logOAuthError)(error);
+    },
+  };
+  const provider = new OAuthProvider(providerOptions);
   const url = new URL(request.url);
   const tokenUrl = new URL(options.tokenEndpoint, url);
   const isTokenRequest = request.method === "POST" &&
     url.origin === tokenUrl.origin && url.pathname === tokenUrl.pathname;
-  const normalized = isTokenRequest
-    ? await normalizeClientAuthentication(request, getOAuthApi(options, env))
-    : request;
-  const response = await provider.fetch(normalized, env, ctx);
-  if (normalized !== request && response.status === 401 &&
-    /^Basic[ \t]/i.test(request.headers.get("Authorization") ?? "")) {
-    response.headers.set("WWW-Authenticate", 'Basic realm="oauth"');
+  try {
+    const normalized = isTokenRequest
+      ? await normalizeClientAuthentication(request, getOAuthApi(providerOptions, env))
+      : request;
+    const response = await provider.fetch(normalized, env, ctx);
+    if (normalized !== request && response.status === 401 &&
+      /^Basic[ \t]/i.test(request.headers.get("Authorization") ?? "")) {
+      response.headers.set("WWW-Authenticate", 'Basic realm="oauth"');
+    }
+    return response;
+  } catch (error) {
+    if (error instanceof CimdFetchError) return clientMetadataUnavailable();
+    throw error;
   }
-  return response;
 }

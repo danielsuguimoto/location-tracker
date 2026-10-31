@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OAuthProvider, type OAuthProviderOptions } from "@cloudflare/workers-oauth-provider";
-import { fetchOAuth } from "../src/oauth";
+import { fetchOAuth, REFRESH_TOKEN_TTL_SECONDS } from "../src/oauth";
 import { handleAuthorize } from "../src/admin/consent";
 import { signSessionValue } from "../src/session";
 import type { Env } from "../src/env";
@@ -12,9 +12,10 @@ vi.mock("cloudflare:workers", () => ({ WorkerEntrypoint: class {} }));
 const ORIGIN = "https://worker.example";
 const REDIRECT = "https://client.example/callback";
 const VERIFIER = "a".repeat(43);
+const DAY_MS = 24 * 60 * 60 * 1000;
 type Method = "client_secret_basic" | "client_secret_post" | "none";
 type Client = { client_id: string; client_secret?: string };
-type Tokens = { access_token: string; refresh_token: string; scope: string; resource: string };
+type Tokens = { access_token: string; refresh_token: string; scope: string; resource: string; expires_in: number };
 
 function formEncode(value: string): string {
   return new URLSearchParams({ v: value }).toString().slice(2);
@@ -67,7 +68,7 @@ describe("OAuth client authentication and refresh", () => {
     return { method: "POST", headers, body };
   }
 
-  async function authorize(client: Client): Promise<string> {
+  async function authorizationUrl(client: Client): Promise<URL> {
     const challenge = Buffer.from(await crypto.subtle.digest(
       "SHA-256", new TextEncoder().encode(VERIFIER),
     )).toString("base64url");
@@ -80,6 +81,11 @@ describe("OAuth client authentication and refresh", () => {
       code_challenge_method: "S256",
       state: "test-state",
     }).toString();
+    return url;
+  }
+
+  async function authorize(client: Client): Promise<string> {
+    const url = await authorizationUrl(client);
     const page = await fetch(url, { headers: { Cookie: cookie } });
     expect(page.status).toBe(200);
     const handle = (await page.text()).match(/name="handle" value="([^"]+)"/)![1]!;
@@ -94,11 +100,11 @@ describe("OAuth client authentication and refresh", () => {
     return new URL(response.headers.get("Location")!).searchParams.get("code")!;
   }
 
-  async function exchange(client: Client, method: Method): Promise<Tokens> {
+  async function exchange(client: Client, method: Method, raw = false): Promise<Tokens> {
     const code = await authorize(client);
     const response = await fetch("/oauth/token", credentials(client, method, {
       grant_type: "authorization_code", code, code_verifier: VERIFIER, redirect_uri: REDIRECT,
-    }));
+    }), raw);
     expect(response.status).toBe(200);
     return response.json() as Promise<Tokens>;
   }
@@ -107,6 +113,31 @@ describe("OAuth client authentication and refresh", () => {
     return fetch("/oauth/token", credentials(client, method, {
       grant_type: "refresh_token", refresh_token: token,
     }), raw);
+  }
+
+  function cimdClient() {
+    vi.stubGlobal("Cloudflare", { compatibilityFlags: { global_fetch_strictly_public: true } });
+    options.clientIdMetadataDocumentEnabled = true;
+    const client: Client = { client_id: `https://cimd.example/${crypto.randomUUID()}.json` };
+    const upstream: { state: 200 | 503 | 429 | 404 | "network" | "invalid" } = { state: 200 };
+    const fetchMetadata = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      expect(input instanceof Request ? input.url : String(input)).toBe(client.client_id);
+      if (upstream.state === "network") throw new TypeError("Test metadata network unavailable");
+      if (upstream.state === "invalid") return Response.json({ client_id: "wrong-id" });
+      return Response.json({
+        client_id: client.client_id, client_name: "Test CIMD client",
+        redirect_uris: [REDIRECT], token_endpoint_auth_method: "none",
+      }, { status: upstream.state, headers: { "Cache-Control": "no-store" } });
+    });
+    return { client, upstream, fetchMetadata };
+  }
+
+  async function expectUnavailable(response: Response) {
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Retry-After")).toBe("30");
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("WWW-Authenticate")).toBeNull();
+    expect(await response.json()).toMatchObject({ error: "temporarily_unavailable" });
   }
 
   beforeEach(async () => {
@@ -142,7 +173,7 @@ describe("OAuth client authentication and refresh", () => {
     cookie = `__Host-lt=${await signSessionValue(env.ADMIN_PASSWORD, Math.floor(Date.now() / 1000))}`;
   });
 
-  afterEach(() => { vi.restoreAllMocks(); });
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
   it("keeps discovery and implicit-registration defaults interoperable", async () => {
     const response = await fetch("/.well-known/oauth-authorization-server");
@@ -150,6 +181,7 @@ describe("OAuth client authentication and refresh", () => {
     expect(await response.json()).toMatchObject({
       grant_types_supported: ["authorization_code", "refresh_token"],
       token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post", "none"],
+      client_id_metadata_document_supported: false,
     });
     const client = await register();
     const tokens = await exchange(client, "client_secret_basic");
@@ -379,5 +411,148 @@ describe("OAuth client authentication and refresh", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ scope: "location:read" });
     expect(put.mock.calls.some(([key]) => key.startsWith("client:"))).toBe(false);
+  });
+
+  it.each([false, true])("reproduces the old absolute expiry and migrates live grants (rolling: %s)", async (rolling) => {
+    const client = await register("none");
+    const tokens = await exchange(client, "none", true);
+    const start = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start + 20 * DAY_MS);
+    const first = await refresh(client, "none", tokens.refresh_token, !rolling);
+    expect(first.status).toBe(200);
+    const next = await first.json() as Tokens;
+    clock.mockReturnValue(start + 31 * DAY_MS);
+    const second = await refresh(client, "none", next.refresh_token, !rolling);
+    expect(second.status).toBe(rolling ? 200 : 400);
+    if (!rolling) expect(await second.json()).toMatchObject({ error: "invalid_grant" });
+  });
+
+  it.each(["none", "client_secret_basic", "client_secret_post"] as const)("keeps active %s grants alive for 145 days, then expires idle grants", async (method) => {
+    expect(REFRESH_TOKEN_TTL_SECONDS).toBe(30 * 24 * 60 * 60);
+    const client = await register(method);
+    let tokens = await exchange(client, method);
+    const start = Date.now();
+    const clock = vi.spyOn(Date, "now");
+    for (const day of [29, 58, 87, 116, 145]) {
+      clock.mockReturnValue(start + day * DAY_MS);
+      const response = await refresh(client, method, tokens.refresh_token);
+      expect(response.status).toBe(200);
+      const rotated = await response.json() as Tokens;
+      expect(rotated.refresh_token).not.toBe(tokens.refresh_token);
+      expect(rotated.expires_in).toBe(3600);
+      expect(rotated.resource).toBe(tokens.resource);
+      expect(rotated.scope).toBe(tokens.scope);
+      tokens = rotated;
+    }
+    expect((await fetch("/mcp", { headers: { Authorization: `Bearer ${tokens.access_token}` } })).status).toBe(200);
+    clock.mockReturnValue(start + 176 * DAY_MS);
+    const expired = await refresh(client, method, tokens.refresh_token);
+    expect(expired.status).toBe(400);
+    expect(await expired.json()).toMatchObject({ error: "invalid_grant" });
+  });
+
+  it("does not renew idle lifetime on failed authentication", async () => {
+    const client = await register("client_secret_post");
+    const tokens = await exchange(client, "client_secret_post");
+    const start = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start + 29 * DAY_MS);
+    expect((await refresh({ ...client, client_secret: "wrong" }, "client_secret_basic", tokens.refresh_token)).status).toBe(401);
+    clock.mockReturnValue(start + 31 * DAY_MS);
+    const expired = await refresh(client, "client_secret_basic", tokens.refresh_token);
+    expect(expired.status).toBe(400);
+    expect(await expired.json()).toMatchObject({ error: "invalid_grant" });
+  });
+
+  it("keeps CIMD disabled unless explicitly configured, without fetching arbitrary URL client IDs", async () => {
+    const upstream = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected outbound fetch"));
+    const response = await refresh({ client_id: "https://cimd.example/disabled.json" }, "none", "invalid");
+    expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({ error: "invalid_client" });
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it("reproduces the provider's CIMD invalid_client response without the outage mapping", async () => {
+    const { client, upstream } = cimdClient();
+    const tokens = await exchange(client, "none");
+    upstream.state = 503;
+    const response = await refresh(client, "none", tokens.refresh_token, true);
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "invalid_client", error_description: "Client not found" });
+  });
+
+  it.each([503, 429, "network", 404, "invalid"] as const)("maps CIMD resolution failure (%s) to retryable 503 without consuming refresh credentials", async (state) => {
+    const { client, upstream } = cimdClient();
+    const tokens = await exchange(client, "none");
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now + 3601 * 1000);
+    const put = vi.spyOn(env.OAUTH_KV, "put");
+    const remove = vi.spyOn(env.OAUTH_KV, "delete");
+    upstream.state = state;
+    await expectUnavailable(await refresh(client, "none", tokens.refresh_token));
+    expect(put).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+    const diagnostics = JSON.stringify(warnings.mock.calls.filter(([message]: unknown[]) => message === "OAuth request rejected"));
+    expect(diagnostics).toContain("metadata_resolution_failed");
+    for (const secret of [tokens.refresh_token, tokens.access_token, client.client_id, env.ADMIN_PASSWORD]) {
+      expect(diagnostics).not.toContain(secret);
+    }
+    upstream.state = 200;
+    const recovered = await refresh(client, "none", tokens.refresh_token);
+    expect(recovered.status).toBe(200);
+    const rotated = await recovered.json() as Tokens;
+    expect(rotated.refresh_token).not.toBe(tokens.refresh_token);
+    expect((await fetch("/mcp", { headers: { Authorization: `Bearer ${rotated.access_token}` } })).status).toBe(200);
+  });
+
+  it.each(["client_secret_basic", "client_secret_post"] as const)("handles CIMD failure during the early %s compatibility lookup without downgrading credentials", async (method) => {
+    const { client, upstream } = cimdClient();
+    const tokens = await exchange(client, "none");
+    const misconfigured = { ...client, client_secret: "unregistered-secret" };
+    upstream.state = 503;
+    await expectUnavailable(await refresh(misconfigured, method, tokens.refresh_token));
+    upstream.state = 200;
+    const rejected = await refresh(misconfigured, method, tokens.refresh_token);
+    expect(rejected.status).toBe(401);
+    expect(await rejected.json()).toMatchObject({ error: "invalid_client" });
+    expect((await refresh(client, "none", tokens.refresh_token)).status).toBe(200);
+  });
+
+  it("retries the same authorization code after a CIMD outage without consuming it", async () => {
+    const { client, upstream } = cimdClient();
+    const code = await authorize(client);
+    const fields = { grant_type: "authorization_code", code, code_verifier: VERIFIER, redirect_uri: REDIRECT };
+    upstream.state = "network";
+    await expectUnavailable(await fetch("/oauth/token", credentials(client, "none", fields)));
+    upstream.state = 200;
+    expect((await fetch("/oauth/token", credentials(client, "none", fields))).status).toBe(200);
+  });
+
+  it.each(["GET", "POST"])("returns retryable 503 during %s authorization when CIMD is unavailable", async (method) => {
+    const { client, upstream } = cimdClient();
+    const url = await authorizationUrl(client);
+    let request: () => Promise<Response>;
+    if (method === "GET") {
+      request = () => fetch(url, { headers: { Cookie: cookie } });
+    } else {
+      const page = await fetch(url, { headers: { Cookie: cookie } });
+      expect(page.status).toBe(200);
+      const handle = (await page.text()).match(/name="handle" value="([^"]+)"/)![1]!;
+      const headers = { Cookie: `${cookie}; ${page.headers.getSetCookie()[0]!.split(";")[0]}`, Origin: ORIGIN };
+      request = () => fetch("/authorize", { method: "POST", headers, body: new URLSearchParams({ handle, decision: "approve", scope: "location:read" }) });
+    }
+    upstream.state = "network";
+    const response = await request();
+    expect(response.headers.get("Location")).toBeNull();
+    await expectUnavailable(response);
+  });
+
+  it("prioritizes retryable CIMD errors over a custom diagnostic callback", async () => {
+    const { client, upstream } = cimdClient();
+    const tokens = await exchange(client, "none");
+    const callback = vi.fn(() => undefined);
+    options.onError = callback;
+    upstream.state = 503;
+    await expectUnavailable(await refresh(client, "none", tokens.refresh_token));
+    expect(callback).not.toHaveBeenCalled();
   });
 });
